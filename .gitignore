@@ -1,0 +1,12 @@
+# Python virtual environments
+.venv/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Runtime log
+log.log
+
+# macOS
+.DS_Store
