@@ -155,6 +155,105 @@ class DateTimeWindow(Window):
         self.window.refresh()
 
 
+class FileManagerWindow(Window):
+    def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str, start_path: str) -> None:
+        super().__init__(x1, y1, x2, y2, title)
+        self.current_path = start_path
+        self.selected_index = 0
+        self.entries: list[tuple[str, str]] = []
+        self.refresh_content()
+
+    def refresh_content(self) -> None:
+        self.entries = []
+        parent = os.path.dirname(self.current_path)
+        if parent and self.current_path != parent:
+            self.entries.append(("..", "dir"))
+
+        try:
+            items = sorted(
+                os.scandir(self.current_path),
+                key=lambda entry: (not entry.is_dir(), entry.name.lower()),
+            )
+        except OSError:
+            self.entries = [("..", "dir")]
+            self.current_path = os.getcwd()
+            items = sorted(
+                os.scandir(self.current_path),
+                key=lambda entry: (not entry.is_dir(), entry.name.lower()),
+            )
+
+        for entry in items:
+            kind = "dir" if entry.is_dir() else "file"
+            self.entries.append((entry.name, kind))
+
+        if self.selected_index >= len(self.entries):
+            self.selected_index = max(0, len(self.entries) - 1)
+
+        self.render()
+
+    def render(self) -> None:
+        self.window.erase()
+        self.window.box()
+        self.print_title(curses.color_pair(2))
+
+        try:
+            display_path = self.current_path
+            if len(display_path) > self.width - 4:
+                display_path = "..." + display_path[-(self.width - 7):]
+            self.window.addstr(1, 2, display_path[: self.width - 4], curses.A_BOLD)
+        except curses.error:
+            pass
+
+        max_rows = max(1, self.height - 4)
+        for offset in range(max_rows):
+            row_idx = offset + 2
+            entry_index = offset
+            if entry_index >= len(self.entries):
+                break
+
+            name, kind = self.entries[entry_index]
+            display_name = name
+            if len(display_name) > self.width - 8:
+                display_name = display_name[: self.width - 9] + "..."
+            prefix = ">" if entry_index == self.selected_index else " "
+            label = f"{prefix} {display_name}"
+            if kind == "dir":
+                label += "/"
+
+            style = curses.A_REVERSE if entry_index == self.selected_index else curses.A_NORMAL
+            try:
+                self.window.addstr(row_idx, 2, label[: self.width - 4], style)
+            except curses.error:
+                pass
+
+        self.window.refresh()
+
+    def handle_key(self, key: int) -> None:
+        if key in (curses.KEY_UP, ord("k")):
+            self.selected_index = max(0, self.selected_index - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.selected_index = min(len(self.entries) - 1, self.selected_index + 1)
+        elif key in (10, 13, curses.KEY_ENTER):
+            if not self.entries:
+                return
+            name, kind = self.entries[self.selected_index]
+            if kind == "dir":
+                if name == "..":
+                    self.current_path = os.path.dirname(self.current_path)
+                else:
+                    self.current_path = os.path.join(self.current_path, name)
+                self.selected_index = 0
+                self.refresh_content()
+        elif key in (8, 127, ord("b")):
+            parent = os.path.dirname(self.current_path)
+            if parent and self.current_path != parent:
+                self.current_path = parent
+                self.selected_index = 0
+                self.refresh_content()
+
+        self.render()
+
+
 class WindowManager:
     def __init__(self) -> None:
         self.windows: dict[str, Window] = {}
@@ -186,14 +285,20 @@ class WindowManager:
             self.active_window_name = names[(active_index + 1) % len(names)]
 
     def handle_input(self) -> bool:
-        key = self.get_active_window().get_window().getch()
-        
+        active_window = self.get_active_window()
+        key = active_window.get_window().getch()
+
         if key == 27:
             return False
-        
+
         if key == 9:
             self.switch_active_window()
-        
+            return True
+
+        if isinstance(active_window, FileManagerWindow):
+            active_window.handle_key(key)
+            return True
+
         return True
 
 def display_func(stdscr: curses.window) -> None:
@@ -236,9 +341,9 @@ def run(stdscr: curses.window) -> None:
         DateTimeWindow(int(columns * 0.125), 2, int(columns * 0.25), 5, "Date", True),
     )
     window_manager.add_window(
-        "Files", 
-        Window(0, int(lines * 0.125), int(columns * 0.25), lines - 3, path)
-        )
+        "Files",
+        FileManagerWindow(0, int(lines * 0.125), int(columns * 0.25), lines - 3, "Files", path),
+    )
     window_manager.add_window(
         "Terminal",
         Window(int(columns * 0.25), 2, int(columns * 0.75), lines - 3, "Terminal"),
@@ -256,8 +361,6 @@ def run(stdscr: curses.window) -> None:
         for window in window_manager.windows.values():
             if isinstance(window, DateTimeWindow):
                 window.render_time()
-            elif isinstance(window, DateWindow):
-                window.render_date()
 
 
 def main() -> None:
