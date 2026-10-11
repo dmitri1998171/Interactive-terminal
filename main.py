@@ -225,7 +225,64 @@ class FileManagerWindow(Window):
         self.selected_index = 0
         self.entries: list[tuple[str, str]] = []
         self.terminal_window = terminal_window
+        self.modal_active = False
+        self.modal_input = ""
+        self.modal_error = ""
         self.refresh_content()
+
+    def open_create_file_modal(self) -> None:
+        self.modal_active = True
+        self.modal_input = ""
+        self.modal_error = ""
+
+    def close_create_file_modal(self) -> None:
+        self.modal_active = False
+        self.modal_input = ""
+        self.modal_error = ""
+
+    def render_modal(self) -> None:
+        if not self.modal_active:
+            return
+
+        terminal_height, terminal_width = curses.LINES, curses.COLS
+        modal_width = min(terminal_width - 10, 46)
+        modal_height = 5
+        modal_x = max(1, (terminal_width - modal_width) // 2)
+        modal_y = max(1, (terminal_height - modal_height) // 2)
+
+        modal_window = curses.newwin(modal_height, modal_width, modal_y, modal_x)
+        modal_window.keypad(True)
+        modal_window.erase()
+
+        modal_bg = curses.color_pair(3)
+        modal_title = curses.color_pair(4)
+        modal_text = curses.color_pair(0)
+        modal_border = curses.color_pair(4)
+
+        try:
+            modal_window.attron(modal_border)
+            modal_window.box()
+            modal_window.attroff(modal_border)
+            modal_window.attron(modal_bg)
+            for y in range(1, modal_height - 1):
+                modal_window.addstr(y, 1, " " * (modal_width - 2))
+            modal_window.attroff(modal_bg)
+
+            modal_window.attron(modal_title | curses.A_BOLD)
+            modal_window.addstr(0, (modal_width - len("Create file")) // 2, "Create file")
+            modal_window.attroff(modal_title | curses.A_BOLD)
+
+            modal_window.attron(modal_text)
+            modal_window.addstr(2, 3, "Name: ")
+            modal_window.addstr(2, 9, self.modal_input[: max(0, modal_width - 8)])
+            if self.modal_error:
+                modal_window.addstr(3, 3, self.modal_error[: max(0, modal_width - 8)], curses.A_BOLD)
+            modal_window.addstr(4, 3, "Enter = create, Esc = cancel")
+            modal_window.attroff(modal_text)
+        except curses.error:
+            pass
+
+        modal_window.refresh()
 
     def refresh_content(self) -> None:
         self.entries = []
@@ -295,7 +352,57 @@ class FileManagerWindow(Window):
 
         self.window.refresh()
 
+    def handle_modal_key(self, key: int) -> None:
+        if key == 27:
+            self.close_create_file_modal()
+            return
+
+        if key in (10, 13, curses.KEY_ENTER):
+            file_name = self.modal_input.strip()
+            if not file_name or len(file_name) > 255:
+                self.modal_error = "Name cannot be empty or exceed 255 symbols"
+                return
+
+            invalid_chars = set('<>:"/\\|?*')
+            if any(ch in invalid_chars for ch in file_name) or file_name in {'.', '..'}:
+                self.modal_error = "Invalid file name"
+                return
+
+            target_path = os.path.join(self.current_path, file_name)
+            if os.path.exists(target_path):
+                self.modal_error = "File already exists"
+                return
+
+            try:
+                with open(target_path, "x", encoding="utf-8") as new_file:
+                    new_file.write("")
+            except OSError:
+                self.modal_error = "Failed to create file"
+                return
+
+            self.close_create_file_modal()
+            self.refresh_content()
+            return
+
+        if key in (8, 127, curses.KEY_BACKSPACE):
+            self.modal_input = self.modal_input[:-1]
+            if self.modal_error:
+                self.modal_error = ""
+            return
+
+        if key in range(32, 127):
+            if len(self.modal_input) >= 255:
+                self.modal_error = "Name cannot exceed 255 symbols"
+                return
+            self.modal_input += chr(key)
+            self.modal_error = ""
+
     def handle_key(self, key: int) -> None:
+        if key == curses.KEY_F1:
+            self.open_create_file_modal()
+            self.render()
+            return
+
         if key in (curses.KEY_UP, 259, 65):
             self.selected_index = max(0, self.selected_index - 1)
         elif key in (curses.KEY_DOWN, 258, 66):
@@ -338,6 +445,8 @@ class WindowManager:
     def __init__(self) -> None:
         self.windows: dict[str, Window] = {}
         self.active_window_name: str | None = None
+        self.last_active_window_name: str | None = None
+        self.modal_window_name: str | None = None
 
     def add_window(self, window: Window) -> None:
         if window.title in self.windows:
@@ -360,6 +469,14 @@ class WindowManager:
             raise RuntimeError("No windows have been registered")
         
         return self.windows[self.active_window_name]
+
+    def set_active_window(self, name: str | None) -> None:
+        if name is None:
+            self.active_window_name = None
+            return
+        if name not in self.windows:
+            return
+        self.active_window_name = name
 
     def switch_active_window(self, reverse: bool = False) -> None:
         names = self.get_switchable_windows()
@@ -389,7 +506,43 @@ class WindowManager:
             else:
                 window.refresh_window(is_active)
 
+        for window in self.windows.values():
+            if isinstance(window, FileManagerWindow) and window.modal_active:
+                window.render_modal()
+
     def handle_input(self) -> bool:
+        if self.modal_window_name is not None:
+            modal_window = self.windows.get(self.modal_window_name)
+            if modal_window is None or not isinstance(modal_window, FileManagerWindow):
+                self.modal_window_name = None
+                if self.last_active_window_name is not None:
+                    self.set_active_window(self.last_active_window_name)
+                    self.last_active_window_name = None
+                self.render_windows()
+                return True
+
+            key = modal_window.get_window().getch()
+            if key == 27:
+                modal_window.close_create_file_modal()
+                self.modal_window_name = None
+                if self.last_active_window_name is not None:
+                    self.set_active_window(self.last_active_window_name)
+                    self.last_active_window_name = None
+                self.render_windows()
+                return True
+
+            modal_window.handle_modal_key(key)
+            if not modal_window.modal_active:
+                self.modal_window_name = None
+                if self.last_active_window_name is not None:
+                    self.set_active_window(self.last_active_window_name)
+                    self.last_active_window_name = None
+            self.render_windows()
+            return True
+
+        if self.active_window_name is None:
+            return True
+
         active_window = self.get_active_window()
         key = active_window.get_window().getch()
 
@@ -403,6 +556,19 @@ class WindowManager:
         if key == curses.KEY_BTAB:
             self.switch_active_window(reverse=True)
             return True
+
+        if key == curses.KEY_F1:
+            file_manager = next(
+                (window for window in self.windows.values() if isinstance(window, FileManagerWindow)),
+                None,
+            )
+            if file_manager is not None:
+                self.last_active_window_name = self.active_window_name
+                self.modal_window_name = file_manager.title
+                file_manager.open_create_file_modal()
+                self.active_window_name = None
+                self.render_windows()
+                return True
 
         if isinstance(active_window, TerminalWindow):
             active_window.handle_key(key)
@@ -432,8 +598,8 @@ def display_func(stdscr: curses.window) -> None:
                 (1, "Tab", "след. окно"),
                 (17, "Shift+Tab", "пред. окно"),
                 (39, "Esc", "Выход"),
-                (50, "F1", "Копировать"),
-                (65, "F5", "Удалить"),
+                (50, "F1", "Создать файл"),
+                (68, "F5", "Удалить"),
             ]
 
         for column, key, description in labels:
@@ -460,13 +626,13 @@ def run(stdscr: curses.window) -> None:
     columns = curses.COLS
     lines = curses.LINES
 
-    terminal_window = TerminalWindow(int(columns * 0.25), 2, int(columns * 0.75), lines - 3, "Terminal")
     window_manager = WindowManager()
-    window_manager.add_window(DateTimeWindow(0, 2, int(columns * 0.125), 5, "Clock"))
-    window_manager.add_window(DateTimeWindow(int(columns * 0.125), 2, int(columns * 0.25), 5, "Date", True))
-    window_manager.add_window(FileManagerWindow(0, int(lines * 0.125), int(columns * 0.25), lines - 3, "Files", path, terminal_window))
+    terminal_window = TerminalWindow(int(columns * 0.25), 2, int(columns * 0.75), lines - 3, "Terminal")
+    window_manager.add_window(FileManagerWindow(0, 2, int(columns * 0.25), lines - 3, "Files", path, terminal_window))
     window_manager.add_window(terminal_window)
-    window_manager.add_window(Window(int(columns * 0.75), 2, columns, lines // 2, "System info"))
+    window_manager.add_window(DateTimeWindow(int(columns * 0.75), 2, int(columns * 0.875), 5, "Clock"))
+    window_manager.add_window(DateTimeWindow(int(columns * 0.875), 2, columns, 5, "Date", True))
+    window_manager.add_window(Window(int(columns * 0.75), int(lines * 0.125)-1, columns, lines // 2, "System info"))
     window_manager.add_window(Window(int(columns * 0.75), lines // 2, columns, lines - 3, "Network info"))
 
     window_manager.active_window_name = "Files"
