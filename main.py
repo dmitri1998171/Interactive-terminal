@@ -167,12 +167,64 @@ class DateTimeWindow(Window):
         self.window.refresh()
 
 
+class TerminalWindow(Window):
+    def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str) -> None:
+        super().__init__(x1, y1, x2, y2, title)
+        self.content_lines: list[str] = []
+        self.scroll_offset = 0
+        self.render()
+
+    def set_content(self, text: str) -> None:
+        self.content_lines = text.splitlines() or [""]
+        self.scroll_offset = 0
+        self.render()
+
+    def scroll_up(self, lines: int = 3) -> None:
+        self.scroll_offset = max(0, self.scroll_offset - lines)
+        self.render()
+
+    def scroll_down(self, lines: int = 3) -> None:
+        max_offset = max(0, len(self.content_lines) - max(1, self.height - 3))
+        self.scroll_offset = min(max_offset, self.scroll_offset + lines)
+        self.render()
+
+    def render(self, active: bool = False) -> None:
+        self.window.erase()
+        border_color = curses.color_pair(4 if active else 3)
+        self.window.attron(border_color)
+        self.window.box()
+        self.window.attroff(border_color)
+        self.print_title(curses.color_pair(2 if active else 3))
+
+        visible_rows = max(1, self.height - 3)
+        start_index = self.scroll_offset
+        end_index = min(len(self.content_lines), start_index + visible_rows)
+
+        for offset, line in enumerate(self.content_lines[start_index:end_index]):
+            if offset >= visible_rows:
+                break
+            text = line[: max(0, self.width - 4)]
+            try:
+                self.window.addstr(1 + offset, 2, text)
+            except curses.error:
+                pass
+
+        self.window.refresh()
+
+    def handle_key(self, key: int) -> None:
+        if key in (curses.KEY_UP, 259):
+            self.scroll_up(3)
+        elif key in (curses.KEY_DOWN, 258):
+            self.scroll_down(3)
+
+
 class FileManagerWindow(Window):
-    def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str, start_path: str) -> None:
+    def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str, start_path: str, terminal_window: TerminalWindow | None = None) -> None:
         super().__init__(x1, y1, x2, y2, title)
         self.current_path = start_path
         self.selected_index = 0
         self.entries: list[tuple[str, str]] = []
+        self.terminal_window = terminal_window
         self.refresh_content()
 
     def refresh_content(self) -> None:
@@ -259,6 +311,17 @@ class FileManagerWindow(Window):
                     self.current_path = os.path.join(self.current_path, name)
                 self.selected_index = 0
                 self.refresh_content()
+            elif kind == "file" and self.terminal_window is not None:
+                file_path = os.path.join(self.current_path, name)
+                try:
+                    with open(file_path, "r", encoding="utf-8") as file:
+                        text = file.read()
+                except UnicodeDecodeError:
+                    with open(file_path, "r", encoding="utf-8", errors="replace") as file:
+                        text = file.read()
+                except OSError:
+                    text = f"Unable to read file: {file_path}"
+                self.terminal_window.set_content(text)
         elif key in (8, 127, ord("b")):
             parent = os.path.dirname(self.current_path)
             if parent and self.current_path != parent:
@@ -321,6 +384,8 @@ class WindowManager:
                 window.render_time(is_active)
             elif isinstance(window, FileManagerWindow):
                 window.render(is_active)
+            elif isinstance(window, TerminalWindow):
+                window.render(is_active)
             else:
                 window.refresh_window(is_active)
 
@@ -337,6 +402,11 @@ class WindowManager:
 
         if key == curses.KEY_BTAB:
             self.switch_active_window(reverse=True)
+            return True
+
+        if isinstance(active_window, TerminalWindow):
+            active_window.handle_key(key)
+            self.render_windows()
             return True
 
         if isinstance(active_window, FileManagerWindow):
@@ -389,17 +459,17 @@ def run(stdscr: curses.window) -> None:
     path = os.getcwd()[: ARR_SIZE - 1]
     columns = curses.COLS
     lines = curses.LINES
-    
+
+    terminal_window = TerminalWindow(int(columns * 0.25), 2, int(columns * 0.75), lines - 3, "Terminal")
     window_manager = WindowManager()
-    window_manager.add_window(FileManagerWindow(0, 2, int(columns * 0.25), lines - 3, "Files", path))
-    window_manager.add_window(Window(int(columns * 0.25), 2, int(columns * 0.75), lines - 3, "Terminal"))
+    window_manager.add_window(DateTimeWindow(0, 2, int(columns * 0.125), 5, "Clock"))
+    window_manager.add_window(DateTimeWindow(int(columns * 0.125), 2, int(columns * 0.25), 5, "Date", True))
+    window_manager.add_window(FileManagerWindow(0, int(lines * 0.125), int(columns * 0.25), lines - 3, "Files", path, terminal_window))
+    window_manager.add_window(terminal_window)
+    window_manager.add_window(Window(int(columns * 0.75), 2, columns, lines // 2, "System info"))
+    window_manager.add_window(Window(int(columns * 0.75), lines // 2, columns, lines - 3, "Network info"))
 
-    window_manager.add_window(DateTimeWindow(int(columns * 0.75), 2, int(columns * 0.875), 5, "Clock"))
-    window_manager.add_window(DateTimeWindow(int(columns * 0.875), 2, columns, 5, "Date", True))
-    window_manager.add_window(Window(        int(columns * 0.75), int(lines * 0.125), columns, lines // 2, "System info"))
-    window_manager.add_window(Window(        int(columns * 0.75), lines // 2, columns, lines - 3, "Network info"))
-
-    window_manager.active_window_name = "Terminal"
+    window_manager.active_window_name = "Files"
     window_manager.render_windows()
 
     while window_manager.handle_input():
