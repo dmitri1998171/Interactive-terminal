@@ -1,5 +1,6 @@
 import curses
 import os
+from datetime import datetime
 from typing import TextIO
 
 ARR_SIZE = 1024
@@ -76,7 +77,6 @@ class Window:
         self.y2 = y2
         self.x2 = x2
         self.title = title
-        log_info(title)
 
         self.window = curses.newwin(self.height, self.width, self.y1, self.x1)
         self.refresh_window()
@@ -84,9 +84,7 @@ class Window:
     def refresh_window(self) -> None:
         self.window.erase()
         self.window.box()
-        self.window.attron(curses.A_BOLD)
         self.print_title(curses.color_pair(2))
-        self.window.attroff(curses.A_BOLD)
         self.window.refresh()
 
     def resize(self, height: int, width: int) -> None:
@@ -103,7 +101,9 @@ class Window:
             title = self.title[: self.width - 2]
 
             try:
+                self.window.attron(curses.A_BOLD)
                 self.window.addstr(0, title_x, title, color)
+                self.window.attroff(curses.A_BOLD)
             except curses.error:
                 pass
 
@@ -129,6 +129,73 @@ class Window:
         return self.width
 
 
+class DateTimeWindow(Window):
+    def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str, _isDate: bool = False) -> None:
+        super().__init__(x1, y1, x2, y2, title)
+        self.isDate = _isDate
+        self.render_time()
+
+    def render_time(self) -> None:
+        if self.isDate:
+            pattern = "%d.%m.%Y"
+        else:
+            pattern = "%H:%M:%S"
+
+        current_time = datetime.now().strftime(pattern)
+        self.window.erase()
+        self.window.box()
+        self.print_title(curses.color_pair(2))
+
+        try:
+            text_x = max(1, (self.width - len(current_time)) // 2)
+            self.window.addstr(1, text_x, current_time, curses.A_BOLD)
+        except curses.error:
+            pass
+
+        self.window.refresh()
+
+
+class WindowManager:
+    def __init__(self) -> None:
+        self.windows: dict[str, Window] = {}
+        self.active_window_name: str | None = None
+
+    def add_window(self, name: str, window: Window) -> None:
+        if name in self.windows:
+            raise ValueError(f"Window already exists: {name}")
+        
+        self.windows[name] = window
+        
+        if self.active_window_name is None:
+            self.active_window_name = name
+
+    def get_window(self, name: str) -> Window:
+        return self.windows[name]
+
+    def get_active_window(self) -> Window:
+        if self.active_window_name is None:
+            raise RuntimeError("No windows have been registered")
+        
+        return self.windows[self.active_window_name]
+
+    def switch_active_window(self) -> None:
+        names = list(self.windows)
+        
+        if names:
+            active_index = names.index(self.active_window_name)
+            self.active_window_name = names[(active_index + 1) % len(names)]
+
+    def handle_input(self) -> bool:
+        key = self.get_active_window().get_window().getch()
+        
+        if key == 27:
+            return False
+        
+        if key == 9:
+            self.switch_active_window()
+        
+        return True
+
 def display_func(stdscr: curses.window) -> None:
     try:
         stdscr.addstr(0, 1, "Left panel    Settings    Right panel")
@@ -151,26 +218,46 @@ def display_func(stdscr: curses.window) -> None:
     stdscr.refresh()
 
 
-def switch_func(window: Window) -> bool:
-    return window.get_window().getch() != 27
-
-
 def run(stdscr: curses.window) -> None:
     init_terminal()
     display_func(stdscr)
 
     path = os.getcwd()[: ARR_SIZE - 1]
-    log_info(path)
-
     columns = curses.COLS
     lines = curses.LINES
-    files_win_left = Window(0, 1, int(columns * 0.33), lines - 4, path)
-    files_win_right = Window(int(columns * 0.33), 1, int(columns * 0.66), lines - 4, path)
-    sysInfo_win = Window(int(columns * 0.66), 1, columns, lines // 2, "System info")
-    networkInfo_win = Window(int(columns * 0.66), lines // 2, columns, lines - 4, "Network info")
+    
+    window_manager = WindowManager()
+    window_manager.add_window(
+        "Clock",
+        DateTimeWindow(0, 2, int(columns * 0.125), 5, "Clock"),
+    )
+    window_manager.add_window(
+        "Date",
+        DateTimeWindow(int(columns * 0.125), 2, int(columns * 0.25), 5, "Date", True),
+    )
+    window_manager.add_window(
+        "Files", 
+        Window(0, int(lines * 0.125), int(columns * 0.25), lines - 3, path)
+        )
+    window_manager.add_window(
+        "Terminal",
+        Window(int(columns * 0.25), 2, int(columns * 0.75), lines - 3, "Terminal"),
+    )
+    window_manager.add_window(
+        "System Info",
+        Window(int(columns * 0.75), 2, columns, lines // 2, "System info"),
+    )
+    window_manager.add_window(
+        "Network Info",
+        Window(int(columns * 0.75), lines // 2, columns, lines - 3, "Network info"),
+    )
 
-    while switch_func(files_win_left):
-        pass
+    while window_manager.handle_input():
+        for window in window_manager.windows.values():
+            if isinstance(window, DateTimeWindow):
+                window.render_time()
+            elif isinstance(window, DateWindow):
+                window.render_date()
 
 
 def main() -> None:

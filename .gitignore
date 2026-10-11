@@ -10,3 +10,5 @@ log.log
 
 # macOS
 .DS_Store
+
+test.py
