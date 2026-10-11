@@ -228,15 +228,36 @@ class FileManagerWindow(Window):
         self.modal_active = False
         self.modal_input = ""
         self.modal_error = ""
+        self.modal_action = "create"
+        self.modal_target_path: str | None = None
         self.refresh_content()
 
     def open_create_file_modal(self) -> None:
         self.modal_active = True
+        self.modal_action = "create"
+        self.modal_target_path = None
         self.modal_input = ""
         self.modal_error = ""
 
+    def open_delete_file_modal(self) -> bool:
+        if not self.entries or self.selected_index >= len(self.entries):
+            return False
+
+        name, kind = self.entries[self.selected_index]
+        if kind != "file":
+            return False
+
+        self.modal_active = True
+        self.modal_action = "delete"
+        self.modal_target_path = os.path.join(self.current_path, name)
+        self.modal_input = ""
+        self.modal_error = ""
+        return True
+
     def close_create_file_modal(self) -> None:
         self.modal_active = False
+        self.modal_action = "create"
+        self.modal_target_path = None
         self.modal_input = ""
         self.modal_error = ""
 
@@ -268,16 +289,22 @@ class FileManagerWindow(Window):
                 modal_window.addstr(y, 1, " " * (modal_width - 2))
             modal_window.attroff(modal_bg)
 
+            title = "Delete file" if self.modal_action == "delete" else "Create file"
             modal_window.attron(modal_title | curses.A_BOLD)
-            modal_window.addstr(0, (modal_width - len("Create file")) // 2, "Create file")
+            modal_window.addstr(0, (modal_width - len(title)) // 2, title)
             modal_window.attroff(modal_title | curses.A_BOLD)
 
             modal_window.attron(modal_text)
-            modal_window.addstr(2, 3, "Name: ")
-            modal_window.addstr(2, 9, self.modal_input[: max(0, modal_width - 8)])
+            if self.modal_action == "delete":
+                prompt = "Вы уверены?"
+                modal_window.addstr(2, max(1, (modal_width - len(prompt)) // 2), prompt)
+            else:
+                modal_window.addstr(2, 3, "Name: ")
+                modal_window.addstr(2, 9, self.modal_input[: max(0, modal_width - 8)])
             if self.modal_error:
                 modal_window.addstr(3, 3, self.modal_error[: max(0, modal_width - 8)], curses.A_BOLD)
-            modal_window.addstr(4, 3, "Enter = create, Esc = cancel")
+            footer = "Enter = delete, Esc = cancel" if self.modal_action == "delete" else "Enter = create, Esc = cancel"
+            modal_window.addstr(4, 3, footer[: max(0, modal_width - 6)])
             modal_window.attroff(modal_text)
         except curses.error:
             pass
@@ -358,6 +385,20 @@ class FileManagerWindow(Window):
             return
 
         if key in (10, 13, curses.KEY_ENTER):
+            if self.modal_action == "delete":
+                if self.modal_target_path is None:
+                    self.close_create_file_modal()
+                    return
+                try:
+                    os.remove(self.modal_target_path)
+                except OSError:
+                    self.modal_error = "Failed to delete file"
+                    return
+
+                self.close_create_file_modal()
+                self.refresh_content()
+                return
+
             file_name = self.modal_input.strip()
             if not file_name or len(file_name) > 255:
                 self.modal_error = "Name cannot be empty or exceed 255 symbols"
@@ -400,6 +441,10 @@ class FileManagerWindow(Window):
     def handle_key(self, key: int) -> None:
         if key == curses.KEY_F1:
             self.open_create_file_modal()
+            self.render()
+            return
+        if key == curses.KEY_F8:
+            self.open_delete_file_modal()
             self.render()
             return
 
@@ -566,6 +611,18 @@ class WindowManager:
                 self.last_active_window_name = self.active_window_name
                 self.modal_window_name = file_manager.title
                 file_manager.open_create_file_modal()
+                self.active_window_name = None
+                self.render_windows()
+                return True
+
+        if key == curses.KEY_F8:
+            file_manager = next(
+                (window for window in self.windows.values() if isinstance(window, FileManagerWindow)),
+                None,
+            )
+            if file_manager is not None and file_manager.open_delete_file_modal():
+                self.last_active_window_name = self.active_window_name
+                self.modal_window_name = file_manager.title
                 self.active_window_name = None
                 self.render_windows()
                 return True
