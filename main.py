@@ -1,11 +1,13 @@
 import curses
 import os
+import sys
 from datetime import datetime
 from typing import TextIO
 
 ARR_SIZE = 1024
 DEBUG = True
 LOG_FILE: TextIO | None = None
+SHIFT_ENTER_KEY = -2
 
 
 def log_info(value: object) -> None:
@@ -266,7 +268,7 @@ class FileManagerWindow(Window):
             return
 
         terminal_height, terminal_width = curses.LINES, curses.COLS
-        modal_width = min(terminal_width - 10, 46)
+        modal_width = min(terminal_width - 10, 50)
         modal_height = 5
         modal_x = max(1, (terminal_width - modal_width) // 2)
         modal_y = max(1, (terminal_height - modal_height) // 2)
@@ -303,8 +305,8 @@ class FileManagerWindow(Window):
                 modal_window.addstr(2, 9, self.modal_input[: max(0, modal_width - 8)])
             if self.modal_error:
                 modal_window.addstr(3, 3, self.modal_error[: max(0, modal_width - 8)], curses.A_BOLD)
-            footer = "Enter = delete, Esc = cancel" if self.modal_action == "delete" else "Enter = create, Esc = cancel"
-            modal_window.addstr(4, 3, footer[: max(0, modal_width - 6)])
+            footer = "Enter = delete, Esc = cancel" if self.modal_action == "delete" else "Enter= file  Shift+Enter= folder  Esc= cancel"
+            modal_window.addstr(4, 2, footer[: max(0, modal_width - 2)])
             modal_window.attroff(modal_text)
         except curses.error:
             pass
@@ -384,8 +386,12 @@ class FileManagerWindow(Window):
             self.close_create_file_modal()
             return
 
-        if key in (10, 13, curses.KEY_ENTER):
+        enter_keys = (10, 13, curses.KEY_ENTER)
+        shifted_enter = key == SHIFT_ENTER_KEY or key == getattr(curses, "KEY_SENTER", None)
+        if key in enter_keys or shifted_enter:
             if self.modal_action == "delete":
+                if shifted_enter:
+                    return
                 if self.modal_target_path is None:
                     self.close_create_file_modal()
                     return
@@ -415,10 +421,13 @@ class FileManagerWindow(Window):
                 return
 
             try:
-                with open(target_path, "x", encoding="utf-8") as new_file:
-                    new_file.write("")
+                if shifted_enter:
+                    os.mkdir(target_path)
+                else:
+                    with open(target_path, "x", encoding="utf-8") as new_file:
+                        new_file.write("")
             except OSError:
-                self.modal_error = "Failed to create file"
+                self.modal_error = "Failed to create folder" if shifted_enter else "Failed to create file"
                 return
 
             self.close_create_file_modal()
@@ -555,6 +564,30 @@ class WindowManager:
             if isinstance(window, FileManagerWindow) and window.modal_active:
                 window.render_modal()
 
+    @staticmethod
+    def read_modal_key(window: curses.window) -> int:
+        key = window.getch()
+        if key != 27:
+            return key
+
+        sequence: list[int] = []
+        window.timeout(50)
+        try:
+            while True:
+                next_key = window.getch()
+                if next_key == curses.ERR:
+                    break
+                sequence.append(next_key)
+                if len(sequence) > 1 and 0x40 <= next_key <= 0x7E:
+                    break
+        finally:
+            window.timeout(-1)
+
+        encoded = bytes(sequence) if all(0 <= value <= 0xFF for value in sequence) else b""
+        if encoded in (b"[13;2u", b"[13;2~", b"[27;2;13~"):
+            return SHIFT_ENTER_KEY
+        return key
+
     def handle_input(self) -> bool:
         if self.modal_window_name is not None:
             modal_window = self.windows.get(self.modal_window_name)
@@ -566,7 +599,7 @@ class WindowManager:
                 self.render_windows()
                 return True
 
-            key = modal_window.get_window().getch()
+            key = self.read_modal_key(modal_window.get_window())
             if key == 27:
                 modal_window.close_create_file_modal()
                 self.modal_window_name = None
@@ -655,8 +688,8 @@ def display_func(stdscr: curses.window) -> None:
                 (1, "Tab", "след. окно"),
                 (17, "Shift+Tab", "пред. окно"),
                 (39, "Esc", "Выход"),
-                (50, "F1", "Создать файл"),
-                (68, "F5", "Удалить"),
+                (50, "F1", "Создать"),
+                (68, "F8", "Удалить"),
             ]
 
         for column, key, description in labels:
@@ -702,12 +735,27 @@ def run(stdscr: curses.window) -> None:
 def main() -> None:
     global LOG_FILE
 
+    supports_modified_keys = os.environ.get("TERM", "").startswith("xterm")
+    if supports_modified_keys:
+        sys.stdout.write("\x1b[>4;2m")
+        sys.stdout.flush()
+
     if DEBUG:
-        with open("log.log", "w", encoding="utf-8") as log_file:
-            LOG_FILE = log_file
-            curses.wrapper(run)
+        try:
+            with open("log.log", "w", encoding="utf-8") as log_file:
+                LOG_FILE = log_file
+                curses.wrapper(run)
+        finally:
+            if supports_modified_keys:
+                sys.stdout.write("\x1b[>4;0m")
+                sys.stdout.flush()
     else:
-        curses.wrapper(run)
+        try:
+            curses.wrapper(run)
+        finally:
+            if supports_modified_keys:
+                sys.stdout.write("\x1b[>4;0m")
+                sys.stdout.flush()
 
 
 if __name__ == "__main__":
