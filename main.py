@@ -70,6 +70,11 @@ def init_terminal() -> None:
 
 class Window:
     def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str) -> None:
+        if x2 <= x1:
+            raise ValueError(f"Invalid window width for {title}: x2 ({x2}) must be greater than x1 ({x1})")
+        if y2 <= y1:
+            raise ValueError(f"Invalid window height for {title}: y2 ({y2}) must be greater than y1 ({y1})")
+
         self.height = y2 - y1
         self.width = x2 - x1
         self.y1 = y1
@@ -265,16 +270,17 @@ class FileManagerWindow(Window):
 
 
 class WindowManager:
-    NON_SWITCHABLE_WINDOWS = {"Clock", "Date", "System Info", "Network Info"}
+    NON_SWITCHABLE_WINDOWS = {"Clock", "Date", "System info", "Network info"}
 
     def __init__(self) -> None:
         self.windows: dict[str, Window] = {}
         self.active_window_name: str | None = None
 
-    def add_window(self, name: str, window: Window) -> None:
-        if name in self.windows:
-            raise ValueError(f"Window already exists: {name}")
+    def add_window(self, window: Window) -> None:
+        if window.title in self.windows:
+            raise ValueError(f"Window already exists: {window.title}")
         
+        name = window.title if window.title == "" else window.title
         self.windows[name] = window
         
         if self.active_window_name is None:
@@ -323,16 +329,14 @@ class WindowManager:
         key = active_window.get_window().getch()
 
         if key == 27:   # Escape key
-            next_key = active_window.get_window().getch()
-            if next_key == ord("["):
-                final_key = active_window.get_window().getch()
-                if final_key == ord("Z"):
-                    self.switch_active_window(reverse=True)
-                    return True
             return False
 
         if key == 9:    # Tab key
             self.switch_active_window()
+            return True
+
+        if key == curses.KEY_BTAB:
+            self.switch_active_window(reverse=True)
             return True
 
         if isinstance(active_window, FileManagerWindow):
@@ -387,33 +391,16 @@ def run(stdscr: curses.window) -> None:
     lines = curses.LINES
     
     window_manager = WindowManager()
-    window_manager.add_window(
-        "Clock",
-        DateTimeWindow(0, 2, int(columns * 0.125), 5, "Clock"),
-    )
-    window_manager.add_window(
-        "Date",
-        DateTimeWindow(int(columns * 0.125), 2, int(columns * 0.25), 5, "Date", True),
-    )
-    window_manager.add_window(
-        "Files",
-        FileManagerWindow(0, int(lines * 0.125), int(columns * 0.25), lines - 3, "Files", path),
-    )
-    window_manager.add_window(
-        "Terminal",
-        Window(int(columns * 0.25), 2, int(columns * 0.75), lines - 3, "Terminal"),
-    )
+    window_manager.add_window(FileManagerWindow(0, 2, int(columns * 0.25), lines - 3, "Files", path))
+    window_manager.add_window(Window(int(columns * 0.25), 2, int(columns * 0.75), lines - 3, "Terminal"))
+
+    window_manager.add_window(DateTimeWindow(int(columns * 0.75), 2, int(columns * 0.875), 5, "Clock"))
+    window_manager.add_window(DateTimeWindow(int(columns * 0.875), 2, columns, 5, "Date", True))
+    window_manager.add_window(Window(        int(columns * 0.75), int(lines * 0.125), columns, lines // 2, "System info"))
+    window_manager.add_window(Window(        int(columns * 0.75), lines // 2, columns, lines - 3, "Network info"))
 
     window_manager.active_window_name = "Terminal"
     window_manager.render_windows()
-    window_manager.add_window(
-        "System Info",
-        Window(int(columns * 0.75), 2, columns, lines // 2, "System info"),
-    )
-    window_manager.add_window(
-        "Network Info",
-        Window(int(columns * 0.75), lines // 2, columns, lines - 3, "Network info"),
-    )
 
     while window_manager.handle_input():
         window_manager.render_windows()
