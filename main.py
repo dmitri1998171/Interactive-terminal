@@ -1,5 +1,6 @@
 import curses
 import os
+import shutil
 import sys
 from datetime import datetime
 from typing import TextIO
@@ -232,6 +233,7 @@ class FileManagerWindow(Window):
         self.modal_error = ""
         self.modal_action = "create"
         self.modal_target_path: str | None = None
+        self.modal_target_is_dir = False
         self.refresh_content()
 
     def open_create_file_modal(self) -> None:
@@ -246,12 +248,13 @@ class FileManagerWindow(Window):
             return False
 
         name, kind = self.entries[self.selected_index]
-        if kind != "file":
+        if kind not in {"file", "dir"} or name == "..":
             return False
 
         self.modal_active = True
         self.modal_action = "delete"
         self.modal_target_path = os.path.join(self.current_path, name)
+        self.modal_target_is_dir = kind == "dir"
         self.modal_input = ""
         self.modal_error = ""
         return True
@@ -260,6 +263,7 @@ class FileManagerWindow(Window):
         self.modal_active = False
         self.modal_action = "create"
         self.modal_target_path = None
+        self.modal_target_is_dir = False
         self.modal_input = ""
         self.modal_error = ""
 
@@ -291,7 +295,10 @@ class FileManagerWindow(Window):
                 modal_window.addstr(y, 1, " " * (modal_width - 2))
             modal_window.attroff(modal_bg)
 
-            title = "Delete file" if self.modal_action == "delete" else "Create file"
+            if self.modal_action == "delete":
+                title = "Delete folder" if self.modal_target_is_dir else "Delete file"
+            else:
+                title = "Create file"
             modal_window.attron(modal_title | curses.A_BOLD)
             modal_window.addstr(0, (modal_width - len(title)) // 2, title)
             modal_window.attroff(modal_title | curses.A_BOLD)
@@ -396,9 +403,12 @@ class FileManagerWindow(Window):
                     self.close_create_file_modal()
                     return
                 try:
-                    os.remove(self.modal_target_path)
+                    if self.modal_target_is_dir and not os.path.islink(self.modal_target_path):
+                        shutil.rmtree(self.modal_target_path)
+                    else:
+                        os.remove(self.modal_target_path)
                 except OSError:
-                    self.modal_error = "Failed to delete file"
+                    self.modal_error = "Failed to delete folder" if self.modal_target_is_dir else "Failed to delete file"
                     return
 
                 self.close_create_file_modal()
