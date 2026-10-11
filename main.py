@@ -2,6 +2,7 @@ import curses
 import os
 import shutil
 import sys
+import termios
 from datetime import datetime
 from typing import TextIO
 
@@ -9,6 +10,7 @@ ARR_SIZE = 1024
 DEBUG = True
 LOG_FILE: TextIO | None = None
 SHIFT_ENTER_KEY = -2
+COMMAND_S_KEY = -3
 
 
 def log_info(value: object) -> None:
@@ -52,6 +54,12 @@ def init_terminal() -> None:
     curses.start_color()
     curses.noecho()
     curses.cbreak()
+    try:
+        terminal_attributes = termios.tcgetattr(sys.stdin.fileno())
+        terminal_attributes[0] &= ~termios.IXON
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, terminal_attributes)
+    except (OSError, termios.error, ValueError):
+        pass
     init_colorpairs()
 
     try:
@@ -173,25 +181,57 @@ class DateTimeWindow(Window):
 class TerminalWindow(Window):
     def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str) -> None:
         super().__init__(x1, y1, x2, y2, title)
-        self.content_lines: list[str] = []
+        self.content_lines: list[str] = [""]
         self.scroll_offset = 0
+        self.cursor_row = 0
+        self.cursor_column = 0
+        self.horizontal_offset = 0
+        self.file_path: str | None = None
+        self.dirty = False
+        self.save_error = ""
         self.render()
 
-    def set_content(self, text: str) -> None:
-        self.content_lines = text.splitlines() or [""]
+    def set_content(self, text: str, file_path: str | None = None) -> None:
+        self.content_lines = text.split("\n") or [""]
         self.scroll_offset = 0
+        self.cursor_row = 0
+        self.cursor_column = 0
+        self.horizontal_offset = 0
+        self.file_path = file_path
+        self.dirty = False
+        self.save_error = ""
         self.render()
 
-    def scroll_up(self, lines: int = 3) -> None:
-        self.scroll_offset = max(0, self.scroll_offset - lines)
-        self.render()
+    def save_content(self) -> None:
+        if self.file_path is None:
+            self.save_error = "No file open"
+            return
 
-    def scroll_down(self, lines: int = 3) -> None:
-        max_offset = max(0, len(self.content_lines) - max(1, self.height - 3))
-        self.scroll_offset = min(max_offset, self.scroll_offset + lines)
-        self.render()
+        try:
+            with open(self.file_path, "w", encoding="utf-8", newline="") as file:
+                file.write("\n".join(self.content_lines))
+        except OSError:
+            self.save_error = "Save failed"
+            return
+
+        self.dirty = False
+        self.save_error = ""
+
+    def keep_cursor_visible(self) -> None:
+        visible_rows = max(1, self.height - 3)
+        visible_columns = max(1, self.width - 4)
+        if self.cursor_row < self.scroll_offset:
+            self.scroll_offset = self.cursor_row
+        elif self.cursor_row >= self.scroll_offset + visible_rows:
+            self.scroll_offset = self.cursor_row - visible_rows + 1
+
+        if self.cursor_column < self.horizontal_offset:
+            self.horizontal_offset = self.cursor_column
+        elif self.cursor_column >= self.horizontal_offset + visible_columns:
+            self.horizontal_offset = self.cursor_column - visible_columns + 1
 
     def render(self, active: bool = False) -> None:
+        self.keep_cursor_visible()
         self.window.erase()
         border_color = curses.color_pair(4 if active else 3)
         self.window.attron(border_color)
@@ -204,21 +244,102 @@ class TerminalWindow(Window):
         end_index = min(len(self.content_lines), start_index + visible_rows)
 
         for offset, line in enumerate(self.content_lines[start_index:end_index]):
-            if offset >= visible_rows:
-                break
-            text = line[: max(0, self.width - 4)]
+            text = line[self.horizontal_offset : self.horizontal_offset + max(0, self.width - 4)]
             try:
                 self.window.addstr(1 + offset, 2, text)
             except curses.error:
                 pass
 
+        if self.file_path is not None:
+            status = "Cmd+S/F2: save" + ("  *" if self.dirty else "")
+            if self.save_error:
+                status = self.save_error
+            try:
+                self.window.addstr(self.height - 1, 2, status[: max(0, self.width - 4)], curses.A_BOLD)
+            except curses.error:
+                pass
+
+        if active and self.content_lines:
+            caret_y = self.cursor_row - self.scroll_offset + 1
+            caret_x = self.cursor_column - self.horizontal_offset + 2
+            line = self.content_lines[self.cursor_row]
+            caret_char = line[self.cursor_column : self.cursor_column + 1] or " "
+            try:
+                self.window.addstr(caret_y, caret_x, caret_char, curses.A_REVERSE)
+            except curses.error:
+                pass
+
         self.window.refresh()
 
-    def handle_key(self, key: int) -> None:
-        if key in (curses.KEY_UP, 259):
-            self.scroll_up(3)
-        elif key in (curses.KEY_DOWN, 258):
-            self.scroll_down(3)
+    def handle_key(self, key: int | str) -> None:
+        if isinstance(key, str):
+            if key in ("\b", "\x7f"):
+                key = curses.KEY_BACKSPACE
+            elif key == "\x13":
+                key = COMMAND_S_KEY
+            elif key in ("\n", "\r"):
+                key = curses.KEY_ENTER
+            elif key.isprintable():
+                line = self.content_lines[self.cursor_row]
+                self.content_lines[self.cursor_row] = line[: self.cursor_column] + key + line[self.cursor_column :]
+                self.cursor_column += len(key)
+                self.dirty = True
+                self.save_error = ""
+                self.render()
+                return
+            else:
+                return
+
+        if key in (19, COMMAND_S_KEY, curses.KEY_F2):
+            self.save_content()
+        elif key == curses.KEY_UP:
+            self.cursor_row = max(0, self.cursor_row - 1)
+            self.cursor_column = min(self.cursor_column, len(self.content_lines[self.cursor_row]))
+        elif key == curses.KEY_DOWN:
+            self.cursor_row = min(len(self.content_lines) - 1, self.cursor_row + 1)
+            self.cursor_column = min(self.cursor_column, len(self.content_lines[self.cursor_row]))
+        elif key == curses.KEY_LEFT:
+            if self.cursor_column > 0:
+                self.cursor_column -= 1
+            elif self.cursor_row > 0:
+                self.cursor_row -= 1
+                self.cursor_column = len(self.content_lines[self.cursor_row])
+        elif key == curses.KEY_RIGHT:
+            if self.cursor_column < len(self.content_lines[self.cursor_row]):
+                self.cursor_column += 1
+            elif self.cursor_row < len(self.content_lines) - 1:
+                self.cursor_row += 1
+                self.cursor_column = 0
+        elif key in (10, 13, curses.KEY_ENTER):
+            line = self.content_lines[self.cursor_row]
+            self.content_lines[self.cursor_row] = line[: self.cursor_column]
+            self.content_lines.insert(self.cursor_row + 1, line[self.cursor_column :])
+            self.cursor_row += 1
+            self.cursor_column = 0
+            self.dirty = True
+        elif key in (8, 127, curses.KEY_BACKSPACE):
+            if self.cursor_column > 0:
+                line = self.content_lines[self.cursor_row]
+                self.content_lines[self.cursor_row] = line[: self.cursor_column - 1] + line[self.cursor_column :]
+                self.cursor_column -= 1
+                self.dirty = True
+            elif self.cursor_row > 0:
+                previous_line = self.content_lines[self.cursor_row - 1]
+                self.cursor_column = len(previous_line)
+                self.content_lines[self.cursor_row - 1] += self.content_lines.pop(self.cursor_row)
+                self.cursor_row -= 1
+                self.dirty = True
+        elif key == curses.KEY_DC:
+            line = self.content_lines[self.cursor_row]
+            if self.cursor_column < len(line):
+                self.content_lines[self.cursor_row] = line[: self.cursor_column] + line[self.cursor_column + 1 :]
+                self.dirty = True
+            elif self.cursor_row < len(self.content_lines) - 1:
+                self.content_lines[self.cursor_row] += self.content_lines.pop(self.cursor_row + 1)
+                self.dirty = True
+
+        self.save_error = "" if self.dirty else self.save_error
+        self.render()
 
 
 class FileManagerWindow(Window):
@@ -484,15 +605,18 @@ class FileManagerWindow(Window):
                 self.refresh_content()
             elif kind == "file" and self.terminal_window is not None:
                 file_path = os.path.join(self.current_path, name)
+                loaded_file_path: str | None = None
                 try:
                     with open(file_path, "r", encoding="utf-8") as file:
                         text = file.read()
+                    loaded_file_path = file_path
                 except UnicodeDecodeError:
                     with open(file_path, "r", encoding="utf-8", errors="replace") as file:
                         text = file.read()
+                    loaded_file_path = file_path
                 except OSError:
                     text = f"Unable to read file: {file_path}"
-                self.terminal_window.set_content(text)
+                self.terminal_window.set_content(text, loaded_file_path)
         elif key in (8, 127, ord("b")):
             parent = os.path.dirname(self.current_path)
             if parent and self.current_path != parent:
@@ -584,7 +708,10 @@ class WindowManager:
         window.timeout(50)
         try:
             while True:
-                next_key = window.getch()
+                try:
+                    next_key = window.getch()
+                except curses.error:
+                    break
                 if next_key == curses.ERR:
                     break
                 sequence.append(next_key)
@@ -596,6 +723,33 @@ class WindowManager:
         encoded = bytes(sequence) if all(0 <= value <= 0xFF for value in sequence) else b""
         if encoded in (b"[13;2u", b"[13;2~", b"[27;2;13~"):
             return SHIFT_ENTER_KEY
+        return key
+
+    @staticmethod
+    def read_terminal_key(window: curses.window) -> int | str:
+        key = window.get_wch()
+        if key != "\x1b":
+            return key
+
+        sequence: list[str] = []
+        window.timeout(50)
+        try:
+            while True:
+                try:
+                    next_key = window.get_wch()
+                except curses.error:
+                    break
+                if next_key == curses.ERR or not isinstance(next_key, str):
+                    break
+                sequence.append(next_key)
+                if len(sequence) > 1 and 0x40 <= ord(next_key) <= 0x7E:
+                    break
+        finally:
+            window.timeout(-1)
+
+        encoded = "".join(sequence)
+        if encoded in ("[115;9u", "[83;10u"):
+            return COMMAND_S_KEY
         return key
 
     def handle_input(self) -> bool:
@@ -632,7 +786,14 @@ class WindowManager:
             return True
 
         active_window = self.get_active_window()
-        key = active_window.get_window().getch()
+        if isinstance(active_window, TerminalWindow):
+            key = self.read_terminal_key(active_window.get_window())
+            if key == "\x1b":
+                key = 27
+            elif key == "\t":
+                key = 9
+        else:
+            key = active_window.get_window().getch()
 
         if key == 27:   # Escape key
             return False
@@ -745,9 +906,15 @@ def run(stdscr: curses.window) -> None:
 def main() -> None:
     global LOG_FILE
 
-    supports_modified_keys = os.environ.get("TERM", "").startswith("xterm")
+    terminal_type = os.environ.get("TERM", "")
+    terminal_program = os.environ.get("TERM_PROGRAM", "")
+    supports_modified_keys = terminal_type.startswith("xterm")
+    supports_command_keys = terminal_program in {"vscode", "iTerm.app", "WezTerm", "kitty", "ghostty"} or terminal_type.startswith(("xterm-kitty", "xterm-ghostty"))
     if supports_modified_keys:
         sys.stdout.write("\x1b[>4;2m")
+        sys.stdout.flush()
+    if supports_command_keys:
+        sys.stdout.write("\x1b[>1u")
         sys.stdout.flush()
 
     if DEBUG:
@@ -756,6 +923,9 @@ def main() -> None:
                 LOG_FILE = log_file
                 curses.wrapper(run)
         finally:
+            if supports_command_keys:
+                sys.stdout.write("\x1b[<u")
+                sys.stdout.flush()
             if supports_modified_keys:
                 sys.stdout.write("\x1b[>4;0m")
                 sys.stdout.flush()
@@ -763,6 +933,9 @@ def main() -> None:
         try:
             curses.wrapper(run)
         finally:
+            if supports_command_keys:
+                sys.stdout.write("\x1b[<u")
+                sys.stdout.flush()
             if supports_modified_keys:
                 sys.stdout.write("\x1b[>4;0m")
                 sys.stdout.flush()
