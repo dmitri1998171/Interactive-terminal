@@ -1,9 +1,11 @@
 import curses
 import os
+import re
 import shutil
 import subprocess
 import sys
 import termios
+import time
 from datetime import datetime
 from typing import TextIO
 
@@ -30,6 +32,16 @@ def log_info(value: object) -> None:
 
 def color_num(fg: int, bg: int) -> int:
     return 0x80 | ((7 & bg) << 4) | (7 & fg)
+
+
+def right_panel_geometry(columns: int, lines: int) -> list[tuple[int, int, int, int]]:
+    x1 = int(columns * 0.75)
+    y1 = max(7, int(lines * 0.125) - 1)
+    panel_height = max(1, (lines - 3 - y1) // 3)
+    return [
+        (x1, y1 + panel_height * index, columns, y1 + panel_height * (index + 1))
+        for index in range(3)
+    ]
 
 
 def curses_color(fg: int) -> int:
@@ -181,10 +193,98 @@ class DateTimeWindow(Window):
 
         try:
             text_x = max(1, (self.width - len(current_time)) // 2)
-            self.window.addstr(1, text_x, current_time, curses.A_BOLD)
+            self.window.addstr(2, text_x, current_time, curses.A_BOLD)
         except curses.error:
             pass
 
+        self.window.refresh()
+
+
+class SystemInfoWindow(Window):
+    REFRESH_INTERVAL = 1.0
+
+    def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str) -> None:
+        self.metrics = ["CPU N/A/100%", "GPU N/A/100%", "RAM N/A", "SSD N/A", "SWAP N/A"]
+        self.last_metrics_update = 0.0
+        super().__init__(x1, y1, x2, y2, title)
+
+    @staticmethod
+    def run_command(arguments: list[str]) -> str:
+        try:
+            result = subprocess.run(
+                arguments,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return result.stdout
+
+    @staticmethod
+    def format_bytes(value: int) -> str:
+        gibibyte = 1024 ** 3
+        if value >= 1024 ** 4:
+            return f"{value / (1024 ** 4):.1f}T"
+        return f"{value / gibibyte:.1f}G"
+
+    def read_metrics(self) -> list[str]:
+        cpu_output = self.run_command(["top", "-l", "1", "-n", "0"])
+        cpu_match = re.search(r"CPU usage: .*?, .*?, ([\d.]+)% idle", cpu_output)
+        cpu_usage = f"{100 - float(cpu_match.group(1)):.0f}%" if cpu_match else "N/A"
+
+        gpu_output = self.run_command([
+            "ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator", "-k", "PerformanceStatistics"
+        ])
+        gpu_match = re.search(r'"Device Utilization %"\s*=\s*([\d.]+)', gpu_output)
+        gpu_usage = f"{float(gpu_match.group(1)):.0f}%" if gpu_match else "N/A"
+
+        total_memory_output = self.run_command(["sysctl", "-n", "hw.memsize"])
+        vm_output = self.run_command(["vm_stat"])
+        memory_total_match = re.search(r"\d+", total_memory_output)
+        page_size_match = re.search(r"page size of (\d+) bytes", vm_output)
+        free_pages_match = re.search(r"Pages free:\s+(\d+)", vm_output)
+        if memory_total_match and page_size_match and free_pages_match:
+            memory_total = int(memory_total_match.group())
+            memory_used = max(0, memory_total - int(page_size_match.group(1)) * int(free_pages_match.group(1)))
+            memory = f"RAM {self.format_bytes(memory_used)}/{self.format_bytes(memory_total)}"
+        else:
+            memory = "RAM N/A"
+
+        swap_output = self.run_command(["sysctl", "vm.swapusage"])
+        swap_match = re.search(r"total = ([\d.]+)([KMGTP])\s+used = ([\d.]+)([KMGTP])", swap_output)
+        if swap_match:
+            unit_bytes = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4, "P": 1024 ** 5}
+            swap_total = int(float(swap_match.group(1)) * unit_bytes[swap_match.group(2)])
+            swap_used = int(float(swap_match.group(3)) * unit_bytes[swap_match.group(4)])
+            swap = f"SWAP {self.format_bytes(swap_used)}/{self.format_bytes(swap_total)}"
+        else:
+            swap = "SWAP N/A"
+
+        try:
+            disk = shutil.disk_usage("/")
+            disk_used = disk.total - disk.free
+            ssd = f"SSD {self.format_bytes(disk_used)}/{self.format_bytes(disk.total)}"
+        except OSError:
+            ssd = "SSD N/A"
+
+        return [f"CPU {cpu_usage}/100%", f"GPU {gpu_usage}/100%", memory, ssd, swap]
+
+    def refresh_window(self, active: bool = False) -> None:
+        now = time.monotonic()
+        if now - self.last_metrics_update >= self.REFRESH_INTERVAL:
+            self.metrics = self.read_metrics()
+            self.last_metrics_update = now
+
+        super().refresh_window(active)
+        for row, metric in enumerate(self.metrics, start=1):
+            if row >= self.height - 1:
+                break
+            try:
+                self.window.addstr(row, 2, metric[: max(0, self.width - 4)])
+            except curses.error:
+                pass
         self.window.refresh()
 
 
@@ -990,7 +1090,7 @@ class FileManagerWindow(Window):
 
 
 class WindowManager:
-    NON_SWITCHABLE_WINDOWS = {"Clock", "Date", "System info", "Network info"}
+    NON_SWITCHABLE_WINDOWS = {"Clock", "Date", "System info", "Hardware info", "Network info"}
 
     def __init__(self) -> None:
         self.windows: dict[str, Window] = {}
@@ -1314,10 +1414,12 @@ def run(stdscr: curses.window) -> None:
     terminal_window = TerminalWindow(int(columns * 0.25), 2, int(columns * 0.75), lines - 3, "Terminal")
     window_manager.add_window(FileManagerWindow(0, 2, int(columns * 0.25), lines - 3, "Files", path, terminal_window))
     window_manager.add_window(terminal_window)
-    window_manager.add_window(DateTimeWindow(int(columns * 0.75), 2, int(columns * 0.875), 5, "Clock"))
-    window_manager.add_window(DateTimeWindow(int(columns * 0.875), 2, columns, 5, "Date", True))
-    window_manager.add_window(Window(int(columns * 0.75), int(lines * 0.125)-1, columns, lines // 2, "System info"))
-    window_manager.add_window(Window(int(columns * 0.75), lines // 2, columns, lines - 3, "Network info"))
+    window_manager.add_window(DateTimeWindow(int(columns * 0.75), 2, int(columns * 0.875), 7, "Clock"))
+    window_manager.add_window(DateTimeWindow(int(columns * 0.875), 2, columns, 7, "Date", True))
+    system_info_geometry, hardware_info_geometry, network_info_geometry = right_panel_geometry(columns, lines)
+    window_manager.add_window(SystemInfoWindow(*system_info_geometry, "System info"))
+    window_manager.add_window(Window(*hardware_info_geometry, "Hardware info"))
+    window_manager.add_window(Window(*network_info_geometry, "Network info"))
 
     window_manager.active_window_name = "Files"
     window_manager.render_windows()
