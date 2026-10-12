@@ -407,14 +407,21 @@ class TerminalWindow(Window):
                 except curses.error:
                     pass
 
+        status_width = max(0, self.width - 4)
+        location = f"Ln {self.cursor_row + 1}, Col {self.cursor_column + 1}"
+        status = ""
         if self.file_path is not None:
-            status = "F4/Cmd+C: copy  F2: save  F3: paste  F5 undo F6 redo" + ("  *" if self.dirty else "")
+            status = "F4 copy  F2 save  F3 paste  F5 undo F6 redo" + (" *" if self.dirty else "")
             if self.save_error:
                 status = self.save_error
-            try:
-                self.window.addstr(self.height - 1, 2, status[: max(0, self.width - 4)], curses.A_BOLD)
-            except curses.error:
-                pass
+        location = location[:status_width]
+        status_width = max(0, status_width - len(location) - bool(status))
+        try:
+            self.window.addstr(self.height - 1, 2, status[:status_width], curses.A_BOLD)
+            location_x = self.width - 2 - len(location)
+            self.window.addstr(self.height - 1, location_x, location, curses.A_BOLD)
+        except curses.error:
+            pass
 
         if active and self.content_lines:
             caret_y = self.cursor_row - self.scroll_offset + 1
