@@ -13,6 +13,10 @@ LOG_FILE: TextIO | None = None
 SHIFT_ENTER_KEY = -2
 COMMAND_S_KEY = -3
 COMMAND_V_KEY = -4
+SHIFT_ARROW_UP = -5
+SHIFT_ARROW_DOWN = -6
+SHIFT_ARROW_LEFT = -7
+SHIFT_ARROW_RIGHT = -8
 
 
 def log_info(value: object) -> None:
@@ -187,6 +191,7 @@ class TerminalWindow(Window):
         self.scroll_offset = 0
         self.cursor_row = 0
         self.cursor_column = 0
+        self.selection_anchor: tuple[int, int] | None = None
         self.horizontal_offset = 0
         self.file_path: str | None = None
         self.dirty = False
@@ -198,6 +203,7 @@ class TerminalWindow(Window):
         self.scroll_offset = 0
         self.cursor_row = 0
         self.cursor_column = 0
+        self.selection_anchor = None
         self.horizontal_offset = 0
         self.file_path = file_path
         self.dirty = False
@@ -242,7 +248,27 @@ class TerminalWindow(Window):
 
         self.dirty = True
         self.save_error = ""
+        self.selection_anchor = None
         self.render()
+
+    def delete_selection(self) -> bool:
+        if self.selection_anchor is None:
+            return False
+
+        selection_start = min(self.selection_anchor, (self.cursor_row, self.cursor_column))
+        selection_end = max(self.selection_anchor, (self.cursor_row, self.cursor_column))
+        self.selection_anchor = None
+        if selection_start == selection_end:
+            return False
+
+        start_row, start_column = selection_start
+        end_row, end_column = selection_end
+        merged_line = self.content_lines[start_row][:start_column] + self.content_lines[end_row][end_column:]
+        self.content_lines[start_row : end_row + 1] = [merged_line]
+        self.cursor_row = start_row
+        self.cursor_column = start_column
+        self.dirty = True
+        return True
 
     def paste_clipboard(self) -> None:
         if self.file_path is None:
@@ -288,11 +314,23 @@ class TerminalWindow(Window):
         end_index = min(len(self.content_lines), start_index + visible_rows)
 
         for offset, line in enumerate(self.content_lines[start_index:end_index]):
-            text = line[self.horizontal_offset : self.horizontal_offset + max(0, self.width - 4)]
-            try:
-                self.window.addstr(1 + offset, 2, text)
-            except curses.error:
-                pass
+            row = start_index + offset
+            visible_line = line[self.horizontal_offset : self.horizontal_offset + max(0, self.width - 4)]
+            selection_start = selection_end = None
+            if self.selection_anchor is not None:
+                selection_start = min(self.selection_anchor, (self.cursor_row, self.cursor_column))
+                selection_end = max(self.selection_anchor, (self.cursor_row, self.cursor_column))
+
+            for column_offset, character in enumerate(visible_line):
+                column = self.horizontal_offset + column_offset
+                selected = (
+                    selection_start is not None
+                    and selection_start <= (row, column) < selection_end
+                )
+                try:
+                    self.window.addstr(1 + offset, 2 + column_offset, character, curses.A_REVERSE if selected else curses.A_NORMAL)
+                except curses.error:
+                    pass
 
         if self.file_path is not None:
             status = "Cmd+S/F2: save  Cmd+V/F3: paste" + ("  *" if self.dirty else "")
@@ -329,23 +367,39 @@ class TerminalWindow(Window):
             else:
                 return
 
+        shifted_arrow_keys = {
+            SHIFT_ARROW_UP,
+            SHIFT_ARROW_DOWN,
+            SHIFT_ARROW_LEFT,
+            SHIFT_ARROW_RIGHT,
+            curses.KEY_SF,
+            curses.KEY_SR,
+            curses.KEY_SLEFT,
+            curses.KEY_SRIGHT,
+        }
+        if key in shifted_arrow_keys:
+            if self.selection_anchor is None:
+                self.selection_anchor = (self.cursor_row, self.cursor_column)
+        elif key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT):
+            self.selection_anchor = None
+
         if key in (19, COMMAND_S_KEY, curses.KEY_F2):
             self.save_content()
         elif key in (COMMAND_V_KEY, curses.KEY_F3):
             self.paste_clipboard()
-        elif key == curses.KEY_UP:
+        elif key in (curses.KEY_UP, SHIFT_ARROW_UP, curses.KEY_SR):
             self.cursor_row = max(0, self.cursor_row - 1)
             self.cursor_column = min(self.cursor_column, len(self.content_lines[self.cursor_row]))
-        elif key == curses.KEY_DOWN:
+        elif key in (curses.KEY_DOWN, SHIFT_ARROW_DOWN, curses.KEY_SF):
             self.cursor_row = min(len(self.content_lines) - 1, self.cursor_row + 1)
             self.cursor_column = min(self.cursor_column, len(self.content_lines[self.cursor_row]))
-        elif key == curses.KEY_LEFT:
+        elif key in (curses.KEY_LEFT, SHIFT_ARROW_LEFT, curses.KEY_SLEFT):
             if self.cursor_column > 0:
                 self.cursor_column -= 1
             elif self.cursor_row > 0:
                 self.cursor_row -= 1
                 self.cursor_column = len(self.content_lines[self.cursor_row])
-        elif key == curses.KEY_RIGHT:
+        elif key in (curses.KEY_RIGHT, SHIFT_ARROW_RIGHT, curses.KEY_SRIGHT):
             if self.cursor_column < len(self.content_lines[self.cursor_row]):
                 self.cursor_column += 1
             elif self.cursor_row < len(self.content_lines) - 1:
@@ -359,17 +413,18 @@ class TerminalWindow(Window):
             self.cursor_column = 0
             self.dirty = True
         elif key in (8, 127, curses.KEY_BACKSPACE):
-            if self.cursor_column > 0:
-                line = self.content_lines[self.cursor_row]
-                self.content_lines[self.cursor_row] = line[: self.cursor_column - 1] + line[self.cursor_column :]
-                self.cursor_column -= 1
-                self.dirty = True
-            elif self.cursor_row > 0:
-                previous_line = self.content_lines[self.cursor_row - 1]
-                self.cursor_column = len(previous_line)
-                self.content_lines[self.cursor_row - 1] += self.content_lines.pop(self.cursor_row)
-                self.cursor_row -= 1
-                self.dirty = True
+            if not self.delete_selection():
+                if self.cursor_column > 0:
+                    line = self.content_lines[self.cursor_row]
+                    self.content_lines[self.cursor_row] = line[: self.cursor_column - 1] + line[self.cursor_column :]
+                    self.cursor_column -= 1
+                    self.dirty = True
+                elif self.cursor_row > 0:
+                    previous_line = self.content_lines[self.cursor_row - 1]
+                    self.cursor_column = len(previous_line)
+                    self.content_lines[self.cursor_row - 1] += self.content_lines.pop(self.cursor_row)
+                    self.cursor_row -= 1
+                    self.dirty = True
         elif key == curses.KEY_DC:
             line = self.content_lines[self.cursor_row]
             if self.cursor_column < len(line):
@@ -793,6 +848,14 @@ class WindowManager:
             return COMMAND_S_KEY
         if encoded in ("[118;9u", "[86;10u"):
             return COMMAND_V_KEY
+        shifted_arrow_sequences = {
+            "[1;2A": SHIFT_ARROW_UP,
+            "[1;2B": SHIFT_ARROW_DOWN,
+            "[1;2C": SHIFT_ARROW_RIGHT,
+            "[1;2D": SHIFT_ARROW_LEFT,
+        }
+        if encoded in shifted_arrow_sequences:
+            return shifted_arrow_sequences[encoded]
         return key
 
     def handle_input(self) -> bool:
