@@ -553,6 +553,7 @@ class FileManagerWindow(Window):
         self.terminal_window = terminal_window
         self.modal_active = False
         self.modal_input = ""
+        self.modal_cursor = 0
         self.modal_error = ""
         self.modal_action = "create"
         self.modal_target_path: str | None = None
@@ -563,8 +564,25 @@ class FileManagerWindow(Window):
         self.modal_active = True
         self.modal_action = "create"
         self.modal_target_path = None
+        self.modal_cursor = 0
         self.modal_input = ""
         self.modal_error = ""
+
+    def open_rename_file_modal(self) -> bool:
+        if not self.entries or self.selected_index >= len(self.entries):
+            return False
+
+        name, kind = self.entries[self.selected_index]
+        if kind != "file":
+            return False
+
+        self.modal_active = True
+        self.modal_action = "rename"
+        self.modal_target_path = os.path.join(self.current_path, name)
+        self.modal_input = self.modal_target_path
+        self.modal_cursor = len(self.modal_input)
+        self.modal_error = ""
+        return True
 
     def open_delete_file_modal(self) -> bool:
         if not self.entries or self.selected_index >= len(self.entries):
@@ -587,6 +605,7 @@ class FileManagerWindow(Window):
         self.modal_action = "create"
         self.modal_target_path = None
         self.modal_target_is_dir = False
+        self.modal_cursor = 0
         self.modal_input = ""
         self.modal_error = ""
 
@@ -595,7 +614,7 @@ class FileManagerWindow(Window):
             return
 
         terminal_height, terminal_width = curses.LINES, curses.COLS
-        modal_width = min(terminal_width - 10, 50)
+        modal_width = min(terminal_width - 10, 60)
         modal_height = 5
         modal_x = max(1, (terminal_width - modal_width) // 2)
         modal_y = max(1, (terminal_height - modal_height) // 2)
@@ -620,6 +639,8 @@ class FileManagerWindow(Window):
 
             if self.modal_action == "delete":
                 title = "Delete folder" if self.modal_target_is_dir else "Delete file"
+            elif self.modal_action == "rename":
+                title = "Move / rename file"
             else:
                 title = "Create file"
             modal_window.attron(modal_title | curses.A_BOLD)
@@ -631,11 +652,23 @@ class FileManagerWindow(Window):
                 prompt = "Вы уверены?"
                 modal_window.addstr(2, max(1, (modal_width - len(prompt)) // 2), prompt)
             else:
-                modal_window.addstr(2, 3, "Name: ")
-                modal_window.addstr(2, 9, self.modal_input[: max(0, modal_width - 8)])
+                label = "Path: " if self.modal_action == "rename" else "Name: "
+                modal_window.addstr(2, 3, label)
+                field_width = max(1, modal_width - 12)
+                field_start = max(0, self.modal_cursor - field_width + 1)
+                visible_input = self.modal_input[field_start : field_start + field_width]
+                modal_window.addstr(2, 9, visible_input)
+                cursor_offset = min(self.modal_cursor - field_start, field_width - 1)
+                cursor_character = visible_input[cursor_offset : cursor_offset + 1] or " "
+                modal_window.addstr(2, 9 + cursor_offset, cursor_character, curses.A_REVERSE)
             if self.modal_error:
                 modal_window.addstr(3, 3, self.modal_error[: max(0, modal_width - 8)], curses.A_BOLD)
-            footer = "Enter = delete, Esc = cancel" if self.modal_action == "delete" else "Enter= file  Shift+Enter= folder  Esc= cancel"
+            if self.modal_action == "delete":
+                footer = "Enter = delete, Esc = cancel"
+            elif self.modal_action == "rename":
+                footer = "Enter = move / rename, Esc = cancel"
+            else:
+                footer = "Enter= file  Shift+Enter= folder  Esc= cancel"
             modal_window.addstr(4, 2, footer[: max(0, modal_width - 2)])
             modal_window.attroff(modal_text)
         except curses.error:
@@ -719,6 +752,51 @@ class FileManagerWindow(Window):
         enter_keys = (10, 13, curses.KEY_ENTER)
         shifted_enter = key == SHIFT_ENTER_KEY or key == getattr(curses, "KEY_SENTER", None)
         if key in enter_keys or shifted_enter:
+            if self.modal_action == "rename":
+                if self.modal_target_path is None:
+                    self.close_create_file_modal()
+                    return
+
+                destination_input = os.path.expanduser(self.modal_input.strip())
+                if not destination_input:
+                    self.modal_error = "Destination path cannot be empty"
+                    return
+
+                if not os.path.isabs(destination_input):
+                    destination_input = os.path.join(self.current_path, destination_input)
+                destination_path = os.path.abspath(destination_input)
+                source_path = os.path.abspath(self.modal_target_path)
+                destination_name = os.path.basename(destination_path)
+                if destination_name in {"", ".", ".."}:
+                    self.modal_error = "Invalid destination file name"
+                    return
+                if not os.path.isdir(os.path.dirname(destination_path)):
+                    self.modal_error = "Destination folder does not exist"
+                    return
+                if destination_path == source_path:
+                    self.close_create_file_modal()
+                    return
+                if os.path.lexists(destination_path):
+                    self.modal_error = "Destination already exists"
+                    return
+
+                try:
+                    shutil.move(source_path, destination_path)
+                except (OSError, shutil.Error):
+                    self.modal_error = "Failed to move or rename file"
+                    return
+
+                destination_is_current = os.path.dirname(destination_path) == os.path.abspath(self.current_path)
+                self.close_create_file_modal()
+                self.refresh_content()
+                if destination_is_current:
+                    for index, (entry_name, _) in enumerate(self.entries):
+                        if entry_name == destination_name:
+                            self.selected_index = index
+                            break
+                    self.render()
+                return
+
             if self.modal_action == "delete":
                 if shifted_enter:
                     return
@@ -767,17 +845,44 @@ class FileManagerWindow(Window):
             self.refresh_content()
             return
 
+        if key in (curses.KEY_LEFT, 260):
+            self.modal_cursor = max(0, self.modal_cursor - 1)
+            return
+
+        if key in (curses.KEY_RIGHT, 261):
+            self.modal_cursor = min(len(self.modal_input), self.modal_cursor + 1)
+            return
+
+        if key in (curses.KEY_HOME,):
+            self.modal_cursor = 0
+            return
+
+        if key in (curses.KEY_END,):
+            self.modal_cursor = len(self.modal_input)
+            return
+
         if key in (8, 127, curses.KEY_BACKSPACE):
-            self.modal_input = self.modal_input[:-1]
+            if self.modal_cursor > 0:
+                self.modal_input = self.modal_input[: self.modal_cursor - 1] + self.modal_input[self.modal_cursor :]
+                self.modal_cursor -= 1
+            if self.modal_error:
+                self.modal_error = ""
+            return
+
+        if key == curses.KEY_DC:
+            if self.modal_cursor < len(self.modal_input):
+                self.modal_input = self.modal_input[: self.modal_cursor] + self.modal_input[self.modal_cursor + 1 :]
             if self.modal_error:
                 self.modal_error = ""
             return
 
         if key in range(32, 127):
-            if len(self.modal_input) >= 255:
-                self.modal_error = "Name cannot exceed 255 symbols"
+            max_length = 4096 if self.modal_action == "rename" else 255
+            if len(self.modal_input) >= max_length:
+                self.modal_error = "Path is too long" if self.modal_action == "rename" else "Name cannot exceed 255 symbols"
                 return
-            self.modal_input += chr(key)
+            self.modal_input = self.modal_input[: self.modal_cursor] + chr(key) + self.modal_input[self.modal_cursor :]
+            self.modal_cursor += 1
             self.modal_error = ""
 
     def handle_key(self, key: int) -> None:
@@ -1027,6 +1132,14 @@ class WindowManager:
         if key == curses.KEY_BTAB:
             self.switch_active_window(reverse=True)
             return True
+
+        if key == curses.KEY_F2 and isinstance(active_window, FileManagerWindow):
+            if active_window.open_rename_file_modal():
+                self.last_active_window_name = self.active_window_name
+                self.modal_window_name = active_window.title
+                self.active_window_name = None
+                self.render_windows()
+                return True
 
         if key == curses.KEY_F1:
             file_manager = next(
