@@ -10,6 +10,7 @@ from typing import TextIO
 ARR_SIZE = 1024
 DEBUG = True
 LOG_FILE: TextIO | None = None
+INPUT_POLL_INTERVAL_MS = 250
 SHIFT_ENTER_KEY = -2
 COMMAND_S_KEY = -3
 COMMAND_V_KEY = -4
@@ -1017,7 +1018,10 @@ class WindowManager:
 
     @staticmethod
     def read_modal_key(window: curses.window) -> int:
-        key = window.getch()
+        try:
+            key = window.getch()
+        except curses.error:
+            return curses.ERR
         if key != 27:
             return key
 
@@ -1035,7 +1039,7 @@ class WindowManager:
                 if len(sequence) > 1 and 0x40 <= next_key <= 0x7E:
                     break
         finally:
-            window.timeout(-1)
+            window.timeout(INPUT_POLL_INTERVAL_MS)
 
         encoded = bytes(sequence) if all(0 <= value <= 0xFF for value in sequence) else b""
         if encoded in (b"[13;2u", b"[13;2~", b"[27;2;13~"):
@@ -1044,7 +1048,10 @@ class WindowManager:
 
     @staticmethod
     def read_terminal_key(window: curses.window) -> int | str:
-        key = window.get_wch()
+        try:
+            key = window.get_wch()
+        except curses.error:
+            return curses.ERR
         if key != "\x1b":
             return key
 
@@ -1062,7 +1069,7 @@ class WindowManager:
                 if len(sequence) > 1 and 0x40 <= ord(next_key) <= 0x7E:
                     break
         finally:
-            window.timeout(-1)
+            window.timeout(INPUT_POLL_INTERVAL_MS)
 
         encoded = "".join(sequence)
         if encoded in ("[115;9u", "[83;10u"):
@@ -1096,7 +1103,9 @@ class WindowManager:
                 self.render_windows()
                 return True
 
-            key = self.read_modal_key(modal_window.get_window())
+            input_window = modal_window.get_window()
+            input_window.timeout(INPUT_POLL_INTERVAL_MS)
+            key = self.read_modal_key(input_window)
             if key == 27:
                 modal_window.close_create_file_modal()
                 self.modal_window_name = None
@@ -1120,13 +1129,20 @@ class WindowManager:
 
         active_window = self.get_active_window()
         if isinstance(active_window, TerminalWindow):
-            key = self.read_terminal_key(active_window.get_window())
+            input_window = active_window.get_window()
+            input_window.timeout(INPUT_POLL_INTERVAL_MS)
+            key = self.read_terminal_key(input_window)
             if key == "\x1b":
                 key = 27
             elif key == "\t":
                 key = 9
         else:
-            key = active_window.get_window().getch()
+            input_window = active_window.get_window()
+            input_window.timeout(INPUT_POLL_INTERVAL_MS)
+            try:
+                key = input_window.getch()
+            except curses.error:
+                key = curses.ERR
 
         if key == 27:   # Escape key
             return False
