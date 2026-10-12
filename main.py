@@ -411,7 +411,7 @@ class TerminalWindow(Window):
         location = f"Ln {self.cursor_row + 1}, Col {self.cursor_column + 1}"
         status = ""
         if self.file_path is not None:
-            status = "F4 copy  F2 save  F3 paste  F5 undo F6 redo" + (" *" if self.dirty else "")
+            status = "F2 save  F3 paste  F4 copy  F5 undo  F6 redo" + (" *" if self.dirty else "")
             if self.save_error:
                 status = self.save_error
         location = location[:status_width]
@@ -573,12 +573,13 @@ class FileManagerWindow(Window):
             return False
 
         name, kind = self.entries[self.selected_index]
-        if kind != "file":
+        if kind not in {"file", "dir"} or name == "..":
             return False
 
         self.modal_active = True
         self.modal_action = "rename"
         self.modal_target_path = os.path.join(self.current_path, name)
+        self.modal_target_is_dir = kind == "dir"
         self.modal_input = self.modal_target_path
         self.modal_cursor = len(self.modal_input)
         self.modal_error = ""
@@ -640,7 +641,7 @@ class FileManagerWindow(Window):
             if self.modal_action == "delete":
                 title = "Delete folder" if self.modal_target_is_dir else "Delete file"
             elif self.modal_action == "rename":
-                title = "Move / rename file"
+                title = "Move / rename folder" if self.modal_target_is_dir else "Move / rename file"
             else:
                 title = "Create file"
             modal_window.attron(modal_title | curses.A_BOLD)
@@ -776,6 +777,10 @@ class FileManagerWindow(Window):
                 if destination_path == source_path:
                     self.close_create_file_modal()
                     return
+                if self.modal_target_is_dir and not os.path.islink(source_path):
+                    if os.path.commonpath((source_path, destination_path)) == source_path:
+                        self.modal_error = "Cannot move folder into itself"
+                        return
                 if os.path.lexists(destination_path):
                     self.modal_error = "Destination already exists"
                     return
@@ -783,7 +788,7 @@ class FileManagerWindow(Window):
                 try:
                     shutil.move(source_path, destination_path)
                 except (OSError, shutil.Error):
-                    self.modal_error = "Failed to move or rename file"
+                    self.modal_error = "Failed to move or rename folder" if self.modal_target_is_dir else "Failed to move or rename file"
                     return
 
                 destination_is_current = os.path.dirname(destination_path) == os.path.abspath(self.current_path)
@@ -1195,9 +1200,10 @@ def display_func(stdscr: curses.window) -> None:
                 (17, "Shift+Tab", "пред. окно"),
                 (39, "Esc", "Выход"),
                 (50, "F1", "Создать"),
-                (68, "F8", "Удалить"),
-                (83, "F5", "Undo"),
-                (96, "F6", "Redo"),
+                (62, "F2", "Переим."),
+                (74, "F8", "Удалить"),
+                (86, "F5", "Undo"),
+                (95, "F6", "Redo"),
             ]
 
         for column, key, description in labels:
