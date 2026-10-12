@@ -1,6 +1,7 @@
 import curses
 import os
 import shutil
+import subprocess
 import sys
 import termios
 from datetime import datetime
@@ -11,6 +12,7 @@ DEBUG = True
 LOG_FILE: TextIO | None = None
 SHIFT_ENTER_KEY = -2
 COMMAND_S_KEY = -3
+COMMAND_V_KEY = -4
 
 
 def log_info(value: object) -> None:
@@ -217,6 +219,48 @@ class TerminalWindow(Window):
         self.dirty = False
         self.save_error = ""
 
+    def insert_text(self, text: str) -> None:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        if not text:
+            return
+
+        line = self.content_lines[self.cursor_row]
+        prefix = line[: self.cursor_column]
+        suffix = line[self.cursor_column :]
+        inserted_lines = text.split("\n")
+        if len(inserted_lines) == 1:
+            self.content_lines[self.cursor_row] = prefix + inserted_lines[0] + suffix
+            self.cursor_column += len(inserted_lines[0])
+        else:
+            self.content_lines[self.cursor_row : self.cursor_row + 1] = (
+                [prefix + inserted_lines[0]]
+                + inserted_lines[1:-1]
+                + [inserted_lines[-1] + suffix]
+            )
+            self.cursor_row += len(inserted_lines) - 1
+            self.cursor_column = len(inserted_lines[-1])
+
+        self.dirty = True
+        self.save_error = ""
+        self.render()
+
+    def paste_clipboard(self) -> None:
+        if self.file_path is None:
+            return
+        try:
+            result = subprocess.run(
+                ["pbpaste"],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+        except (OSError, subprocess.SubprocessError):
+            self.save_error = "Clipboard paste failed"
+            self.render()
+            return
+        self.insert_text(result.stdout)
+
     def keep_cursor_visible(self) -> None:
         visible_rows = max(1, self.height - 3)
         visible_columns = max(1, self.width - 4)
@@ -251,7 +295,7 @@ class TerminalWindow(Window):
                 pass
 
         if self.file_path is not None:
-            status = "Cmd+S/F2: save" + ("  *" if self.dirty else "")
+            status = "Cmd+S/F2: save  Cmd+V/F3: paste" + ("  *" if self.dirty else "")
             if self.save_error:
                 status = self.save_error
             try:
@@ -280,18 +324,15 @@ class TerminalWindow(Window):
             elif key in ("\n", "\r"):
                 key = curses.KEY_ENTER
             elif key.isprintable():
-                line = self.content_lines[self.cursor_row]
-                self.content_lines[self.cursor_row] = line[: self.cursor_column] + key + line[self.cursor_column :]
-                self.cursor_column += len(key)
-                self.dirty = True
-                self.save_error = ""
-                self.render()
+                self.insert_text(key)
                 return
             else:
                 return
 
         if key in (19, COMMAND_S_KEY, curses.KEY_F2):
             self.save_content()
+        elif key in (COMMAND_V_KEY, curses.KEY_F3):
+            self.paste_clipboard()
         elif key == curses.KEY_UP:
             self.cursor_row = max(0, self.cursor_row - 1)
             self.cursor_column = min(self.cursor_column, len(self.content_lines[self.cursor_row]))
@@ -750,6 +791,8 @@ class WindowManager:
         encoded = "".join(sequence)
         if encoded in ("[115;9u", "[83;10u"):
             return COMMAND_S_KEY
+        if encoded in ("[118;9u", "[86;10u"):
+            return COMMAND_V_KEY
         return key
 
     def handle_input(self) -> bool:
