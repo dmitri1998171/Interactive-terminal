@@ -14,6 +14,8 @@ SHIFT_ENTER_KEY = -2
 COMMAND_S_KEY = -3
 COMMAND_V_KEY = -4
 COMMAND_C_KEY = -9
+COMMAND_Z_KEY = -10
+COMMAND_SHIFT_Z_KEY = -11
 SHIFT_ARROW_UP = -5
 SHIFT_ARROW_DOWN = -6
 SHIFT_ARROW_LEFT = -7
@@ -197,6 +199,9 @@ class TerminalWindow(Window):
         self.file_path: str | None = None
         self.dirty = False
         self.save_error = ""
+        self.saved_content_lines = self.content_lines.copy()
+        self.undo_history: list[tuple[list[str], int, int, tuple[int, int] | None]] = []
+        self.redo_history: list[tuple[list[str], int, int, tuple[int, int] | None]] = []
         self.render()
 
     def set_content(self, text: str, file_path: str | None = None) -> None:
@@ -209,6 +214,9 @@ class TerminalWindow(Window):
         self.file_path = file_path
         self.dirty = False
         self.save_error = ""
+        self.saved_content_lines = self.content_lines.copy()
+        self.undo_history.clear()
+        self.redo_history.clear()
         self.render()
 
     def save_content(self) -> None:
@@ -225,6 +233,39 @@ class TerminalWindow(Window):
 
         self.dirty = False
         self.save_error = ""
+        self.saved_content_lines = self.content_lines.copy()
+
+    def capture_editor_state(self) -> tuple[list[str], int, int, tuple[int, int] | None]:
+        return self.content_lines.copy(), self.cursor_row, self.cursor_column, self.selection_anchor
+
+    def remember_undo_state(self) -> None:
+        self.undo_history.append(self.capture_editor_state())
+        if len(self.undo_history) > 100:
+            del self.undo_history[0]
+        self.redo_history.clear()
+
+    def restore_editor_state(self, state: tuple[list[str], int, int, tuple[int, int] | None]) -> None:
+        lines, self.cursor_row, self.cursor_column, self.selection_anchor = state
+        self.content_lines = lines.copy()
+        self.dirty = self.content_lines != self.saved_content_lines
+        self.save_error = ""
+        self.render()
+
+    def undo(self) -> None:
+        if not self.undo_history:
+            return
+        self.redo_history.append(self.capture_editor_state())
+        if len(self.redo_history) > 100:
+            del self.redo_history[0]
+        self.restore_editor_state(self.undo_history.pop())
+
+    def redo(self) -> None:
+        if not self.redo_history:
+            return
+        self.undo_history.append(self.capture_editor_state())
+        if len(self.undo_history) > 100:
+            del self.undo_history[0]
+        self.restore_editor_state(self.redo_history.pop())
 
     def insert_text(self, text: str) -> None:
         text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -235,6 +276,7 @@ class TerminalWindow(Window):
         prefix = line[: self.cursor_column]
         suffix = line[self.cursor_column :]
         inserted_lines = text.split("\n")
+        self.remember_undo_state()
         if len(inserted_lines) == 1:
             self.content_lines[self.cursor_row] = prefix + inserted_lines[0] + suffix
             self.cursor_column += len(inserted_lines[0])
@@ -264,6 +306,7 @@ class TerminalWindow(Window):
 
         start_row, start_column = selection_start
         end_row, end_column = selection_end
+        self.remember_undo_state()
         merged_line = self.content_lines[start_row][:start_column] + self.content_lines[end_row][end_column:]
         self.content_lines[start_row : end_row + 1] = [merged_line]
         self.cursor_row = start_row
@@ -365,7 +408,7 @@ class TerminalWindow(Window):
                     pass
 
         if self.file_path is not None:
-            status = "F4/Cmd+C: copy  F2: save  F3: paste" + ("  *" if self.dirty else "")
+            status = "F4/Cmd+C: copy  F2: save  F3: paste  F5 undo F6 redo" + ("  *" if self.dirty else "")
             if self.save_error:
                 status = self.save_error
             try:
@@ -417,6 +460,10 @@ class TerminalWindow(Window):
 
         if key in (19, COMMAND_S_KEY, curses.KEY_F2):
             self.save_content()
+        elif key in (COMMAND_Z_KEY, curses.KEY_F5):
+            self.undo()
+        elif key in (COMMAND_SHIFT_Z_KEY, curses.KEY_F6):
+            self.redo()
         elif key in (COMMAND_C_KEY, curses.KEY_F4):
             self.copy_selection()
         elif key in (COMMAND_V_KEY, curses.KEY_F3):
@@ -441,6 +488,7 @@ class TerminalWindow(Window):
                 self.cursor_column = 0
         elif key in (10, 13, curses.KEY_ENTER):
             line = self.content_lines[self.cursor_row]
+            self.remember_undo_state()
             self.content_lines[self.cursor_row] = line[: self.cursor_column]
             self.content_lines.insert(self.cursor_row + 1, line[self.cursor_column :])
             self.cursor_row += 1
@@ -450,11 +498,13 @@ class TerminalWindow(Window):
             if not self.delete_selection():
                 if self.cursor_column > 0:
                     line = self.content_lines[self.cursor_row]
+                    self.remember_undo_state()
                     self.content_lines[self.cursor_row] = line[: self.cursor_column - 1] + line[self.cursor_column :]
                     self.cursor_column -= 1
                     self.dirty = True
                 elif self.cursor_row > 0:
                     previous_line = self.content_lines[self.cursor_row - 1]
+                    self.remember_undo_state()
                     self.cursor_column = len(previous_line)
                     self.content_lines[self.cursor_row - 1] += self.content_lines.pop(self.cursor_row)
                     self.cursor_row -= 1
@@ -462,9 +512,11 @@ class TerminalWindow(Window):
         elif key == curses.KEY_DC:
             line = self.content_lines[self.cursor_row]
             if self.cursor_column < len(line):
+                self.remember_undo_state()
                 self.content_lines[self.cursor_row] = line[: self.cursor_column] + line[self.cursor_column + 1 :]
                 self.dirty = True
             elif self.cursor_row < len(self.content_lines) - 1:
+                self.remember_undo_state()
                 self.content_lines[self.cursor_row] += self.content_lines.pop(self.cursor_row + 1)
                 self.dirty = True
 
@@ -880,6 +932,10 @@ class WindowManager:
         encoded = "".join(sequence)
         if encoded in ("[115;9u", "[83;10u"):
             return COMMAND_S_KEY
+        if encoded in ("[122;9u", "[90;9u"):
+            return COMMAND_Z_KEY
+        if encoded in ("[122;10u", "[90;10u"):
+            return COMMAND_SHIFT_Z_KEY
         if encoded in ("[99;9u", "[67;10u"):
             return COMMAND_C_KEY
         if encoded in ("[118;9u", "[86;10u"):
@@ -1003,6 +1059,8 @@ def display_func(stdscr: curses.window) -> None:
                 (39, "Esc", "Выход"),
                 (50, "F1", "Создать"),
                 (68, "F8", "Удалить"),
+                (83, "F5", "Undo"),
+                (96, "F6", "Redo"),
             ]
 
         for column, key, description in labels:
