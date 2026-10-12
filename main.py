@@ -1,4 +1,5 @@
 import curses
+import ipaddress
 import os
 import re
 import shutil
@@ -6,6 +7,10 @@ import subprocess
 import sys
 import termios
 import threading
+import time
+import urllib.error
+import urllib.request
+from collections import deque
 from datetime import datetime
 from typing import TextIO
 
@@ -372,6 +377,208 @@ class HardwareInfoWindow(Window):
                 break
             try:
                 self.window.addstr(row, 3, component[: max(0, self.width - 5)])
+            except curses.error:
+                pass
+        self.window.refresh()
+
+
+class NetworkInfoWindow(Window):
+    REFRESH_INTERVAL = 15.0
+    TRAFFIC_SAMPLE_INTERVAL = 1.0
+    TRAFFIC_HISTORY_SIZE = 24
+
+    def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str) -> None:
+        self.network_lines = ["Interfaces: N/A", "Local IP: N/A", "Public IP: N/A", "Type: N/A"]
+        self._network_lock = threading.Lock()
+        self._network_stop = threading.Event()
+        self.traffic_samples: deque[tuple[float, float]] = deque(maxlen=self.TRAFFIC_HISTORY_SIZE)
+        self._traffic_lock = threading.Lock()
+        self._traffic_stop = threading.Event()
+        super().__init__(x1, y1, x2, y2, title)
+        self._network_thread = threading.Thread(target=self._refresh_network, daemon=True)
+        self._network_thread.start()
+        self._traffic_thread = threading.Thread(target=self._sample_traffic, daemon=True)
+        self._traffic_thread.start()
+
+    def _refresh_network(self) -> None:
+        while not self._network_stop.is_set():
+            try:
+                lines = self.read_network_info()
+            except Exception:
+                lines = ["Interfaces: N/A", "Local IP: N/A", "Public IP: N/A", "Type: N/A"]
+            with self._network_lock:
+                self.network_lines = lines
+            if self._network_stop.wait(self.REFRESH_INTERVAL):
+                break
+
+    @staticmethod
+    def run_command(arguments: list[str]) -> str:
+        try:
+            result = subprocess.run(
+                arguments,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return result.stdout
+
+    @staticmethod
+    def read_public_ip() -> str:
+        try:
+            with urllib.request.urlopen("https://api.ipify.org", timeout=4) as response:
+                address = response.read(64).decode("ascii").strip()
+            return str(ipaddress.ip_address(address))
+        except (OSError, UnicodeDecodeError, ValueError, urllib.error.URLError):
+            return "N/A"
+
+    def read_network_info(self) -> list[str]:
+        ports_output = self.run_command(["networksetup", "-listallhardwareports"])
+        port_names = {
+            device: port.strip()
+            for port, device in re.findall(
+                r"Hardware Port:\s*([^\n]+)\nDevice:\s*([^\n]+)",
+                ports_output,
+            )
+        }
+
+        route_output = self.run_command(["route", "-n", "get", "default"])
+        default_match = re.search(r"^\s*interface:\s*(\S+)", route_output, re.MULTILINE)
+        default_interface = default_match.group(1) if default_match else ""
+
+        interface_output = self.run_command(["ifconfig", "-a"])
+        active_interfaces: list[tuple[str, str, list[str]]] = []
+        for block in re.split(r"(?m)(?=^[\w.-]+: flags=)", interface_output):
+            header = re.match(r"([\w.-]+): flags=.*", block)
+            if not header:
+                continue
+            interface = header.group(1)
+            if interface == "lo0" or not re.search(r"\bstatus: active\b", block) and interface != default_interface:
+                continue
+
+            addresses = [
+                address
+                for address in re.findall(r"^\s+inet\s+(\d+(?:\.\d+){3})\b", block, re.MULTILINE)
+                if not address.startswith(("127.", "169.254."))
+            ]
+            if not addresses:
+                continue
+            port_name = port_names.get(interface, "")
+            if "wi-fi" in port_name.lower() or "airport" in port_name.lower():
+                connection = "Wi-Fi"
+            elif "ethernet" in port_name.lower():
+                connection = "Ethernet"
+            elif "thunderbolt" in port_name.lower():
+                connection = "Thunderbolt"
+            else:
+                connection = port_name or "Network"
+            active_interfaces.append((interface, connection, addresses))
+
+        active_interfaces.sort(key=lambda item: item[0] != default_interface)
+        if active_interfaces:
+            interface_names = [interface for interface, _, _ in active_interfaces[:2]]
+            if len(active_interfaces) > 2:
+                interface_names.append(f"+{len(active_interfaces) - 2}")
+            interface_lines = ["Interfaces: " + ", ".join(interface_names)]
+            primary_interface, connection_type, primary_addresses = active_interfaces[0]
+            local_ip = primary_addresses[0]
+        else:
+            interface_lines = ["Interfaces: none"]
+            local_ip = "N/A"
+            connection_type = "Disconnected"
+
+        public_ip = self.read_public_ip()
+        return interface_lines + [
+            f"Local IP: {local_ip}",
+            f"Public IP: {public_ip}",
+            f"Type: {connection_type}",
+        ]
+
+    def read_traffic_counters(self) -> tuple[str, int, int] | None:
+        route_output = self.run_command(["route", "-n", "get", "default"])
+        route_match = re.search(r"^\s*interface:\s*(\S+)", route_output, re.MULTILINE)
+        if not route_match:
+            return None
+        interface = route_match.group(1)
+
+        netstat_output = self.run_command(["netstat", "-ibn"])
+        for line in netstat_output.splitlines():
+            fields = line.split()
+            if len(fields) < 11 or fields[0] != interface or not fields[2].startswith("<Link#"):
+                continue
+            try:
+                return interface, int(fields[6]), int(fields[9])
+            except ValueError:
+                return None
+        return None
+
+    def _sample_traffic(self) -> None:
+        previous = self.read_traffic_counters()
+        previous_time = time.monotonic()
+        while not self._traffic_stop.wait(self.TRAFFIC_SAMPLE_INTERVAL):
+            current = self.read_traffic_counters()
+            current_time = time.monotonic()
+            download_rate = upload_rate = 0.0
+            if previous is not None and current is not None and previous[0] == current[0]:
+                elapsed = max(0.001, current_time - previous_time)
+                download_rate = max(0, current[1] - previous[1]) / elapsed
+                upload_rate = max(0, current[2] - previous[2]) / elapsed
+            with self._traffic_lock:
+                self.traffic_samples.append((download_rate, upload_rate))
+            previous = current
+            previous_time = current_time
+
+    @staticmethod
+    def format_rate(bytes_per_second: float) -> str:
+        if bytes_per_second < 1024:
+            return f"{bytes_per_second:.0f}B/s"
+        if bytes_per_second < 1024 ** 2:
+            return f"{bytes_per_second / 1024:.1f}K/s"
+        return f"{bytes_per_second / (1024 ** 2):.1f}M/s"
+
+    @staticmethod
+    def sparkline(values: list[float], width: int) -> str:
+        if width <= 0:
+            return ""
+        values = values[-width:]
+        values = [0.0] * (width - len(values)) + values
+        maximum = max(values, default=0.0)
+        levels = ".:-=+*#%@"
+        if maximum <= 0:
+            return levels[0] * width
+        return "".join(levels[min(len(levels) - 1, int(value / maximum * (len(levels) - 1)))] for value in values)
+
+    def refresh_window(self, active: bool = False) -> None:
+        super().refresh_window(active)
+        with self._network_lock:
+            lines = self.network_lines.copy()
+        with self._traffic_lock:
+            samples = list(self.traffic_samples)
+        for row, line in enumerate(lines, start=2):
+            if row >= self.height - 4:
+                break
+            try:
+                self.window.addstr(row, 3, line[: max(0, self.width - 4)])
+            except curses.error:
+                pass
+
+        graph_width = max(0, self.width - 20)
+        download_values = [sample[0] for sample in samples]
+        upload_values = [sample[1] for sample in samples]
+        current_download = download_values[-1] if download_values else 0.0
+        current_upload = upload_values[-1] if upload_values else 0.0
+        traffic_rows = (
+            (self.height - 4, "Traffic (recent)"),
+            (self.height - 3, f"Down {self.format_rate(current_download)} {self.sparkline(download_values, graph_width)}"),
+            (self.height - 2, f"Up   {self.format_rate(current_upload)} {self.sparkline(upload_values, graph_width)}"),
+        )
+        for row, line in traffic_rows:
+            if row < 1:
+                continue
+            try:
+                self.window.addstr(row, 3, line[: max(0, self.width - 4)])
             except curses.error:
                 pass
         self.window.refresh()
@@ -1508,7 +1715,7 @@ def run(stdscr: curses.window) -> None:
     system_info_geometry, hardware_info_geometry, network_info_geometry = right_panel_geometry(columns, lines)
     window_manager.add_window(SystemInfoWindow(*system_info_geometry, "System info"))
     window_manager.add_window(HardwareInfoWindow(*hardware_info_geometry, "Hardware info"))
-    window_manager.add_window(Window(*network_info_geometry, "Network info"))
+    window_manager.add_window(NetworkInfoWindow(*network_info_geometry, "Network info"))
 
     window_manager.active_window_name = "Files"
     window_manager.render_windows()
