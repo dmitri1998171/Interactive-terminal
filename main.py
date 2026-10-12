@@ -462,7 +462,14 @@ class TerminalWindow(Window):
         if key in shifted_arrow_keys:
             if self.selection_anchor is None:
                 self.selection_anchor = (self.cursor_row, self.cursor_column)
-        elif key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT):
+        elif key in (
+            curses.KEY_UP,
+            curses.KEY_DOWN,
+            curses.KEY_LEFT,
+            curses.KEY_RIGHT,
+            curses.KEY_PPAGE,
+            curses.KEY_NPAGE,
+        ):
             self.selection_anchor = None
 
         if key in (19, COMMAND_S_KEY, curses.KEY_F2):
@@ -475,6 +482,12 @@ class TerminalWindow(Window):
             self.copy_selection()
         elif key in (COMMAND_V_KEY, curses.KEY_F3):
             self.paste_clipboard()
+        elif key == curses.KEY_PPAGE:
+            self.cursor_row = 0
+            self.cursor_column = 0
+        elif key == curses.KEY_NPAGE:
+            self.cursor_row = len(self.content_lines) - 1
+            self.cursor_column = len(self.content_lines[self.cursor_row])
         elif key in (curses.KEY_UP, SHIFT_ARROW_UP, curses.KEY_SR):
             self.cursor_row = max(0, self.cursor_row - 1)
             self.cursor_column = min(self.cursor_column, len(self.content_lines[self.cursor_row]))
@@ -777,7 +790,11 @@ class FileManagerWindow(Window):
             self.render()
             return
 
-        if key in (curses.KEY_UP, 259, 65):
+        if key == curses.KEY_PPAGE:
+            self.selected_index = 0
+        elif key == curses.KEY_NPAGE:
+            self.selected_index = max(0, len(self.entries) - 1)
+        elif key in (curses.KEY_UP, 259, 65):
             self.selected_index = max(0, self.selected_index - 1)
         elif key in (curses.KEY_DOWN, 258, 66):
             self.selected_index = min(len(self.entries) - 1, self.selected_index + 1)
