@@ -587,6 +587,23 @@ class FileManagerWindow(Window):
         self.modal_error = ""
         return True
 
+    def open_copy_file_modal(self) -> bool:
+        if not self.entries or self.selected_index >= len(self.entries):
+            return False
+
+        name, kind = self.entries[self.selected_index]
+        if kind not in {"file", "dir"} or name == "..":
+            return False
+
+        self.modal_active = True
+        self.modal_action = "copy"
+        self.modal_target_path = os.path.join(self.current_path, name)
+        self.modal_target_is_dir = kind == "dir"
+        self.modal_input = self.modal_target_path
+        self.modal_cursor = len(self.modal_input)
+        self.modal_error = ""
+        return True
+
     def open_delete_file_modal(self) -> bool:
         if not self.entries or self.selected_index >= len(self.entries):
             return False
@@ -644,6 +661,8 @@ class FileManagerWindow(Window):
                 title = "Delete folder" if self.modal_target_is_dir else "Delete file"
             elif self.modal_action == "rename":
                 title = "Move / rename folder" if self.modal_target_is_dir else "Move / rename file"
+            elif self.modal_action == "copy":
+                title = "Copy folder" if self.modal_target_is_dir else "Copy file"
             else:
                 title = "Create file"
             modal_window.attron(modal_title | curses.A_BOLD)
@@ -655,7 +674,7 @@ class FileManagerWindow(Window):
                 prompt = "Вы уверены?"
                 modal_window.addstr(2, max(1, (modal_width - len(prompt)) // 2), prompt)
             else:
-                label = "Path: " if self.modal_action == "rename" else "Name: "
+                label = "Path: " if self.modal_action in {"rename", "copy"} else "Name: "
                 modal_window.addstr(2, 3, label)
                 field_width = max(1, modal_width - 12)
                 field_start = max(0, self.modal_cursor - field_width + 1)
@@ -670,6 +689,8 @@ class FileManagerWindow(Window):
                 footer = "Enter = delete, Esc = cancel"
             elif self.modal_action == "rename":
                 footer = "Enter = move / rename, Esc = cancel"
+            elif self.modal_action == "copy":
+                footer = "Enter = copy, Esc = cancel"
             else:
                 footer = "Enter= file  Shift+Enter= folder  Esc= cancel"
             modal_window.addstr(4, 2, footer[: max(0, modal_width - 2)])
@@ -755,7 +776,7 @@ class FileManagerWindow(Window):
         enter_keys = (10, 13, curses.KEY_ENTER)
         shifted_enter = key == SHIFT_ENTER_KEY or key == getattr(curses, "KEY_SENTER", None)
         if key in enter_keys or shifted_enter:
-            if self.modal_action == "rename":
+            if self.modal_action in {"rename", "copy"}:
                 if self.modal_target_path is None:
                     self.close_create_file_modal()
                     return
@@ -777,26 +798,49 @@ class FileManagerWindow(Window):
                     self.modal_error = "Destination folder does not exist"
                     return
                 if destination_path == source_path:
+                    if self.modal_action == "copy":
+                        self.modal_error = "Source and destination are identical"
+                        return
                     self.close_create_file_modal()
                     return
                 if self.modal_target_is_dir and not os.path.islink(source_path):
                     if os.path.commonpath((source_path, destination_path)) == source_path:
-                        self.modal_error = "Cannot move folder into itself"
+                        action_verb = "copy" if self.modal_action == "copy" else "move"
+                        self.modal_error = f"Cannot {action_verb} folder into itself"
                         return
                 if os.path.lexists(destination_path):
                     self.modal_error = "Destination already exists"
                     return
 
                 try:
-                    shutil.move(source_path, destination_path)
+                    if self.modal_action == "copy":
+                        if self.modal_target_is_dir:
+                            if os.path.islink(source_path):
+                                os.symlink(os.readlink(source_path), destination_path)
+                            else:
+                                shutil.copytree(source_path, destination_path)
+                        else:
+                            shutil.copy2(source_path, destination_path)
+                    else:
+                        shutil.move(source_path, destination_path)
                 except (OSError, shutil.Error):
-                    self.modal_error = "Failed to move or rename folder" if self.modal_target_is_dir else "Failed to move or rename file"
+                    if self.modal_action == "copy":
+                        self.modal_error = "Failed to copy folder" if self.modal_target_is_dir else "Failed to copy file"
+                    else:
+                        self.modal_error = "Failed to move or rename folder" if self.modal_target_is_dir else "Failed to move or rename file"
                     return
 
                 destination_is_current = os.path.dirname(destination_path) == os.path.abspath(self.current_path)
+                action = self.modal_action
                 self.close_create_file_modal()
                 self.refresh_content()
-                if destination_is_current:
+                if destination_is_current and action == "copy":
+                    for index, (entry_name, _) in enumerate(self.entries):
+                        if entry_name == destination_name:
+                            self.selected_index = index
+                            break
+                    self.render()
+                elif destination_is_current:
                     for index, (entry_name, _) in enumerate(self.entries):
                         if entry_name == destination_name:
                             self.selected_index = index
@@ -1163,6 +1207,14 @@ class WindowManager:
                 self.render_windows()
                 return True
 
+        if key == curses.KEY_F3 and isinstance(active_window, FileManagerWindow):
+            if active_window.open_copy_file_modal():
+                self.last_active_window_name = self.active_window_name
+                self.modal_window_name = active_window.title
+                self.active_window_name = None
+                self.render_windows()
+                return True
+
         if key == curses.KEY_F1:
             file_manager = next(
                 (window for window in self.windows.values() if isinstance(window, FileManagerWindow)),
@@ -1228,9 +1280,10 @@ def display_func(stdscr: curses.window) -> None:
                 (39, "Esc", "Выход"),
                 (50, "F1", "Создать"),
                 (62, "F2", "Переим."),
-                (74, "F8", "Удалить"),
-                (86, "F5", "Undo"),
-                (95, "F6", "Redo"),
+                (74, "F3", "Копия"),
+                (84, "F8", "Удалить"),
+                (96, "F5", "Undo"),
+                (105, "F6", "Redo"),
             ]
 
         for column, key, description in labels:
