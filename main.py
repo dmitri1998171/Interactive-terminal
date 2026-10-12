@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import sys
 import termios
-import time
+import threading
 from datetime import datetime
 from typing import TextIO
 
@@ -205,8 +205,22 @@ class SystemInfoWindow(Window):
 
     def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str) -> None:
         self.metrics = ["CPU N/A/100%", "GPU N/A/100%", "RAM N/A", "SSD N/A", "SWAP N/A"]
-        self.last_metrics_update = 0.0
+        self._metrics_lock = threading.Lock()
+        self._metrics_stop = threading.Event()
         super().__init__(x1, y1, x2, y2, title)
+        self._metrics_thread = threading.Thread(target=self._refresh_metrics, daemon=True)
+        self._metrics_thread.start()
+
+    def _refresh_metrics(self) -> None:
+        while not self._metrics_stop.is_set():
+            try:
+                metrics = self.read_metrics()
+            except Exception:
+                metrics = ["CPU N/A/100%", "GPU N/A/100%", "RAM N/A", "SSD N/A", "SWAP N/A"]
+            with self._metrics_lock:
+                self.metrics = metrics
+            if self._metrics_stop.wait(self.REFRESH_INTERVAL):
+                break
 
     @staticmethod
     def run_command(arguments: list[str]) -> str:
@@ -272,17 +286,92 @@ class SystemInfoWindow(Window):
         return [f"CPU {cpu_usage}/100%", f"GPU {gpu_usage}/100%", memory, ssd, swap]
 
     def refresh_window(self, active: bool = False) -> None:
-        now = time.monotonic()
-        if now - self.last_metrics_update >= self.REFRESH_INTERVAL:
-            self.metrics = self.read_metrics()
-            self.last_metrics_update = now
-
         super().refresh_window(active)
-        for row, metric in enumerate(self.metrics, start=1):
+        with self._metrics_lock:
+            metrics = self.metrics.copy()
+        for row, metric in enumerate(metrics, start=2):
             if row >= self.height - 1:
                 break
             try:
-                self.window.addstr(row, 2, metric[: max(0, self.width - 4)])
+                self.window.addstr(row, 3, metric[: max(0, self.width - 5)])
+            except curses.error:
+                pass
+        self.window.refresh()
+
+
+class HardwareInfoWindow(Window):
+    REFRESH_INTERVAL = 30.0
+
+    def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str) -> None:
+        self.components = ["CPU N/A", "GPU N/A", "RAM N/A", "SSD N/A", "SWAP Virtual (macOS)"]
+        self._components_lock = threading.Lock()
+        self._components_stop = threading.Event()
+        super().__init__(x1, y1, x2, y2, title)
+        self._components_thread = threading.Thread(target=self._refresh_components, daemon=True)
+        self._components_thread.start()
+
+    def _refresh_components(self) -> None:
+        while not self._components_stop.is_set():
+            try:
+                components = self.read_components()
+            except Exception:
+                components = ["CPU N/A", "GPU N/A", "RAM N/A", "SSD N/A", "SWAP Virtual (macOS)"]
+            with self._components_lock:
+                self.components = components
+            if self._components_stop.wait(self.REFRESH_INTERVAL):
+                break
+
+    @staticmethod
+    def run_command(arguments: list[str]) -> str:
+        try:
+            result = subprocess.run(
+                arguments,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return result.stdout
+
+    def read_components(self) -> list[str]:
+        cpu = self.run_command(["sysctl", "-n", "machdep.cpu.brand_string"]).strip() or "N/A"
+
+        display_data = self.run_command(["system_profiler", "SPDisplaysDataType", "-detailLevel", "mini"])
+        gpu_match = re.search(r"Graphics/Displays:\s*\n\s*([^:\n]+):", display_data)
+        gpu = gpu_match.group(1).strip() if gpu_match else "N/A"
+
+        memory_data = self.run_command(["system_profiler", "SPMemoryDataType", "-detailLevel", "mini"])
+        memory_type_match = re.search(r"^[ \t]*Type:[ \t]*(.+)$", memory_data, re.MULTILINE)
+        memory_vendor_match = re.search(r"^[ \t]*Manufacturer:[ \t]*(.+)$", memory_data, re.MULTILINE)
+        memory_size_match = re.search(r"^[ \t]*Memory:[ \t]*(.+)$", memory_data, re.MULTILINE)
+        memory_parts = [match.group(1).strip() for match in (memory_vendor_match, memory_type_match) if match]
+        if memory_size_match:
+            memory_parts.append(memory_size_match.group(1).strip())
+        memory = " ".join(memory_parts) or "N/A"
+
+        storage_data = self.run_command(["system_profiler", "SPNVMeDataType", "-detailLevel", "mini"])
+        storage_match = re.search(r"^\s*Model:\s*(.+)$", storage_data, re.MULTILINE)
+        storage = storage_match.group(1).strip() if storage_match else "N/A"
+
+        return [
+            f"CPU {cpu}",
+            f"GPU {gpu}",
+            f"RAM {memory}",
+            f"SSD {storage}",
+            "SWAP Virtual (macOS)",
+        ]
+
+    def refresh_window(self, active: bool = False) -> None:
+        super().refresh_window(active)
+        with self._components_lock:
+            components = self.components.copy()
+        for row, component in enumerate(components, start=2):
+            if row >= self.height - 1:
+                break
+            try:
+                self.window.addstr(row, 3, component[: max(0, self.width - 5)])
             except curses.error:
                 pass
         self.window.refresh()
@@ -1418,7 +1507,7 @@ def run(stdscr: curses.window) -> None:
     window_manager.add_window(DateTimeWindow(int(columns * 0.875), 2, columns, 7, "Date", True))
     system_info_geometry, hardware_info_geometry, network_info_geometry = right_panel_geometry(columns, lines)
     window_manager.add_window(SystemInfoWindow(*system_info_geometry, "System info"))
-    window_manager.add_window(Window(*hardware_info_geometry, "Hardware info"))
+    window_manager.add_window(HardwareInfoWindow(*hardware_info_geometry, "Hardware info"))
     window_manager.add_window(Window(*network_info_geometry, "Network info"))
 
     window_manager.active_window_name = "Files"
