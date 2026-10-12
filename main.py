@@ -408,12 +408,13 @@ class TerminalWindow(Window):
                     pass
 
         status_width = max(0, self.width - 4)
-        location = f"Ln {self.cursor_row + 1}, Col {self.cursor_column + 1}"
+        location = ""
         status = ""
-        if self.file_path is not None:
+        if active and self.file_path is not None:
             status = "F2 save  F3 paste  F4 copy  F5 undo  F6 redo" + (" *" if self.dirty else "")
             if self.save_error:
                 status = self.save_error
+            location = f"Ln {self.cursor_row + 1}, Col {self.cursor_column + 1}"
         location = location[:status_width]
         status_width = max(0, status_width - len(location) - bool(status))
         try:
@@ -1177,7 +1178,17 @@ class WindowManager:
             return True
 
         if isinstance(active_window, FileManagerWindow):
+            opening_file = (
+                key in (10, 13, curses.KEY_ENTER)
+                and active_window.terminal_window is not None
+                and 0 <= active_window.selected_index < len(active_window.entries)
+                and active_window.entries[active_window.selected_index][1] == "file"
+            )
             active_window.handle_key(key)
+            if opening_file:
+                terminal_window = active_window.terminal_window
+                if terminal_window is not None and self.windows.get(terminal_window.title) is terminal_window:
+                    self.active_window_name = terminal_window.title
 
         self.render_windows()
         return True
