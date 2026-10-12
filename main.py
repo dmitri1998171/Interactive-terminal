@@ -13,6 +13,7 @@ LOG_FILE: TextIO | None = None
 SHIFT_ENTER_KEY = -2
 COMMAND_S_KEY = -3
 COMMAND_V_KEY = -4
+COMMAND_C_KEY = -9
 SHIFT_ARROW_UP = -5
 SHIFT_ARROW_DOWN = -6
 SHIFT_ARROW_LEFT = -7
@@ -270,6 +271,37 @@ class TerminalWindow(Window):
         self.dirty = True
         return True
 
+    def copy_selection(self) -> None:
+        if self.selection_anchor is None:
+            return
+
+        selection_start = min(self.selection_anchor, (self.cursor_row, self.cursor_column))
+        selection_end = max(self.selection_anchor, (self.cursor_row, self.cursor_column))
+        if selection_start == selection_end:
+            return
+
+        start_row, start_column = selection_start
+        end_row, end_column = selection_end
+        if start_row == end_row:
+            selected_text = self.content_lines[start_row][start_column:end_column]
+        else:
+            selected_lines = [self.content_lines[start_row][start_column:]]
+            selected_lines.extend(self.content_lines[start_row + 1 : end_row])
+            selected_lines.append(self.content_lines[end_row][:end_column])
+            selected_text = "\n".join(selected_lines)
+
+        try:
+            subprocess.run(
+                ["pbcopy"],
+                input=selected_text,
+                check=True,
+                text=True,
+                encoding="utf-8",
+            )
+        except (OSError, subprocess.SubprocessError):
+            self.save_error = "Clipboard copy failed"
+            self.render()
+
     def paste_clipboard(self) -> None:
         if self.file_path is None:
             return
@@ -333,7 +365,7 @@ class TerminalWindow(Window):
                     pass
 
         if self.file_path is not None:
-            status = "Cmd+S/F2: save  Cmd+V/F3: paste" + ("  *" if self.dirty else "")
+            status = "F4/Cmd+C: copy  F2: save  F3: paste" + ("  *" if self.dirty else "")
             if self.save_error:
                 status = self.save_error
             try:
@@ -385,6 +417,8 @@ class TerminalWindow(Window):
 
         if key in (19, COMMAND_S_KEY, curses.KEY_F2):
             self.save_content()
+        elif key in (COMMAND_C_KEY, curses.KEY_F4):
+            self.copy_selection()
         elif key in (COMMAND_V_KEY, curses.KEY_F3):
             self.paste_clipboard()
         elif key in (curses.KEY_UP, SHIFT_ARROW_UP, curses.KEY_SR):
@@ -846,6 +880,8 @@ class WindowManager:
         encoded = "".join(sequence)
         if encoded in ("[115;9u", "[83;10u"):
             return COMMAND_S_KEY
+        if encoded in ("[99;9u", "[67;10u"):
+            return COMMAND_C_KEY
         if encoded in ("[118;9u", "[86;10u"):
             return COMMAND_V_KEY
         shifted_arrow_sequences = {
