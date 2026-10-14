@@ -18,6 +18,9 @@ ARR_SIZE = 1024
 DEBUG = True
 LOG_FILE: TextIO | None = None
 INPUT_POLL_INTERVAL_MS = 250
+SYSTEM_BAR_GREEN_PAIR = 5
+SYSTEM_BAR_YELLOW_PAIR = 6
+SYSTEM_BAR_RED_PAIR = 7
 SHIFT_ENTER_KEY = -2
 COMMAND_S_KEY = -3
 COMMAND_V_KEY = -4
@@ -99,6 +102,9 @@ def init_terminal() -> None:
         (2, curses.COLOR_WHITE, curses.COLOR_RED),
         (3, curses.COLOR_BLACK, curses.COLOR_WHITE),
         (4, curses.COLOR_YELLOW, curses.COLOR_RED),
+        (SYSTEM_BAR_GREEN_PAIR, curses.COLOR_GREEN, curses.COLOR_BLACK),
+        (SYSTEM_BAR_YELLOW_PAIR, curses.COLOR_YELLOW, curses.COLOR_BLACK),
+        (SYSTEM_BAR_RED_PAIR, curses.COLOR_RED, curses.COLOR_BLACK),
     ):
         try:
             curses.init_pair(pair, foreground, background)
@@ -209,7 +215,13 @@ class SystemInfoWindow(Window):
     REFRESH_INTERVAL = 1.0
 
     def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str) -> None:
-        self.metrics = ["CPU N/A/100%", "GPU N/A/100%", "RAM N/A", "SSD N/A", "SWAP N/A"]
+        self.metrics: list[tuple[str, str, float | None]] = [
+            ("CPU", "N/A", None),
+            ("GPU", "N/A", None),
+            ("RAM", "N/A", None),
+            ("SSD", "N/A", None),
+            ("SWAP", "N/A", None),
+        ]
         self._metrics_lock = threading.Lock()
         self._metrics_stop = threading.Event()
         super().__init__(x1, y1, x2, y2, title)
@@ -221,7 +233,7 @@ class SystemInfoWindow(Window):
             try:
                 metrics = self.read_metrics()
             except Exception:
-                metrics = ["CPU N/A/100%", "GPU N/A/100%", "RAM N/A", "SSD N/A", "SWAP N/A"]
+                metrics = [(name, "N/A", None) for name in ("CPU", "GPU", "RAM", "SSD", "SWAP")]
             with self._metrics_lock:
                 self.metrics = metrics
             if self._metrics_stop.wait(self.REFRESH_INTERVAL):
@@ -248,16 +260,24 @@ class SystemInfoWindow(Window):
             return f"{value / (1024 ** 4):.1f}T"
         return f"{value / gibibyte:.1f}G"
 
-    def read_metrics(self) -> list[str]:
+    @staticmethod
+    def format_capacity(current: int, total: int) -> str:
+        unit = 1024 ** 4 if total >= 1024 ** 4 else 1024 ** 3
+        suffix = "T" if unit == 1024 ** 4 else "G"
+        return f"{current / unit:.1f}/{total / unit:.1f}{suffix}"
+
+    def read_metrics(self) -> list[tuple[str, str, float | None]]:
         cpu_output = self.run_command(["top", "-l", "1", "-n", "0"])
         cpu_match = re.search(r"CPU usage: .*?, .*?, ([\d.]+)% idle", cpu_output)
-        cpu_usage = f"{100 - float(cpu_match.group(1)):.0f}%" if cpu_match else "N/A"
+        cpu_ratio = max(0.0, min(1.0, (100 - float(cpu_match.group(1))) / 100)) if cpu_match else None
+        cpu_usage = f"{cpu_ratio * 100:.0f}%/100%" if cpu_ratio is not None else "N/A"
 
         gpu_output = self.run_command([
             "ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator", "-k", "PerformanceStatistics"
         ])
         gpu_match = re.search(r'"Device Utilization %"\s*=\s*([\d.]+)', gpu_output)
-        gpu_usage = f"{float(gpu_match.group(1)):.0f}%" if gpu_match else "N/A"
+        gpu_ratio = max(0.0, min(1.0, float(gpu_match.group(1)) / 100)) if gpu_match else None
+        gpu_usage = f"{gpu_ratio * 100:.0f}%/100%" if gpu_ratio is not None else "N/A"
 
         total_memory_output = self.run_command(["sysctl", "-n", "hw.memsize"])
         vm_output = self.run_command(["vm_stat"])
@@ -267,9 +287,11 @@ class SystemInfoWindow(Window):
         if memory_total_match and page_size_match and free_pages_match:
             memory_total = int(memory_total_match.group())
             memory_used = max(0, memory_total - int(page_size_match.group(1)) * int(free_pages_match.group(1)))
-            memory = f"RAM {self.format_bytes(memory_used)}/{self.format_bytes(memory_total)}"
+            memory = self.format_capacity(memory_used, memory_total)
+            memory_ratio = memory_used / memory_total if memory_total else None
         else:
-            memory = "RAM N/A"
+            memory = "N/A"
+            memory_ratio = None
 
         swap_output = self.run_command(["sysctl", "vm.swapusage"])
         swap_match = re.search(r"total = ([\d.]+)([KMGTP])\s+used = ([\d.]+)([KMGTP])", swap_output)
@@ -277,30 +299,66 @@ class SystemInfoWindow(Window):
             unit_bytes = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4, "P": 1024 ** 5}
             swap_total = int(float(swap_match.group(1)) * unit_bytes[swap_match.group(2)])
             swap_used = int(float(swap_match.group(3)) * unit_bytes[swap_match.group(4)])
-            swap = f"SWAP {self.format_bytes(swap_used)}/{self.format_bytes(swap_total)}"
+            swap = self.format_capacity(swap_used, swap_total)
+            swap_ratio = swap_used / swap_total if swap_total else None
         else:
-            swap = "SWAP N/A"
+            swap = "N/A"
+            swap_ratio = None
 
         try:
             disk = shutil.disk_usage("/")
             disk_used = disk.total - disk.free
-            ssd = f"SSD {self.format_bytes(disk_used)}/{self.format_bytes(disk.total)}"
+            ssd = self.format_capacity(disk_used, disk.total)
+            ssd_ratio = disk_used / disk.total if disk.total else None
         except OSError:
-            ssd = "SSD N/A"
+            ssd = "N/A"
+            ssd_ratio = None
 
-        return [f"CPU {cpu_usage}/100%", f"GPU {gpu_usage}/100%", memory, ssd, swap]
+        return [
+            ("CPU", cpu_usage, cpu_ratio),
+            ("GPU", gpu_usage, gpu_ratio),
+            ("RAM", memory, memory_ratio),
+            ("SSD", ssd, ssd_ratio),
+            ("SWAP", swap, swap_ratio),
+        ]
 
     def refresh_window(self, active: bool = False) -> None:
         super().refresh_window(active)
         with self._metrics_lock:
             metrics = self.metrics.copy()
-        for row, metric in enumerate(metrics, start=2):
+        content_width = max(0, self.width - 5)
+        for row, (name, value, ratio) in enumerate(metrics, start=2):
             if row >= self.height - 1:
                 break
-            try:
-                self.window.addstr(row, 3, metric[: max(0, self.width - 5)])
-            except curses.error:
-                pass
+            prefix = f"{name} {value}"
+            bar_inner_width = max(0, content_width - len(prefix) - 3)
+            if ratio is None or bar_inner_width < 3:
+                metric = prefix
+                try:
+                    self.window.addstr(row, 3, metric[:content_width])
+                except curses.error:
+                    pass
+            else:
+                utilization = max(0.0, min(1.0, ratio)) * 100
+                if utilization > 85:
+                    color_pair = SYSTEM_BAR_RED_PAIR
+                elif utilization < 50:
+                    color_pair = SYSTEM_BAR_GREEN_PAIR
+                else:
+                    color_pair = SYSTEM_BAR_YELLOW_PAIR
+                filled = round(utilization / 100 * bar_inner_width)
+                empty = bar_inner_width - filled
+                bar_start = 3 + len(prefix)
+                try:
+                    self.window.addstr(row, 3, prefix)
+                    self.window.addstr(row, bar_start, " [")
+                    if filled:
+                        self.window.addstr(row, bar_start + 2, "#" * filled, curses.color_pair(color_pair))
+                    if empty:
+                        self.window.addstr(row, bar_start + 2 + filled, "." * empty)
+                    self.window.addstr(row, bar_start + 2 + bar_inner_width, "]")
+                except curses.error:
+                    pass
         self.window.refresh()
 
 
