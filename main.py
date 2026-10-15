@@ -1,4 +1,5 @@
 import curses
+import curses.panel
 import ipaddress
 import os
 import re
@@ -31,6 +32,9 @@ SHIFT_ARROW_UP = -5
 SHIFT_ARROW_DOWN = -6
 SHIFT_ARROW_LEFT = -7
 SHIFT_ARROW_RIGHT = -8
+ALT_TAB_1 = -20
+ALT_TAB_2 = -21
+ALT_TAB_3 = -22
 
 
 def log_info(value: object) -> None:
@@ -1446,11 +1450,40 @@ class FileManagerWindow(Window):
 class WindowManager:
     NON_SWITCHABLE_WINDOWS = {"Clock", "Date", "System info", "Hardware info", "Network info"}
 
-    def __init__(self) -> None:
+    MENU_DEFINITIONS = {
+        1: ("Left panel", [("Files", "window:Files"), ("Terminal", "window:Terminal")]),
+        2: (
+            "Settings",
+            [
+                ("Create file", "create"),
+                ("Move / rename", "rename"),
+                ("Copy", "copy"),
+                ("Delete", "delete"),
+            ],
+        ),
+        3: (
+            "Right panel",
+            [
+                ("Clock", "window:Clock"),
+                ("Date", "window:Date"),
+                ("System info", "window:System info"),
+                ("Hardware info", "window:Hardware info"),
+                ("Network info", "window:Network info"),
+            ],
+        ),
+    }
+
+    def __init__(self, stdscr: curses.window | None = None) -> None:
         self.windows: dict[str, Window] = {}
         self.active_window_name: str | None = None
         self.last_active_window_name: str | None = None
         self.modal_window_name: str | None = None
+        self.stdscr = stdscr
+        self.context_menu_number: int | None = None
+        self.context_menu_items: list[tuple[str, str]] = []
+        self.context_menu_selection = 0
+        self.context_menu_window: curses.window | None = None
+        self.context_menu_panel: curses.panel.panel | None = None
 
     def add_window(self, window: Window) -> None:
         if window.title in self.windows:
@@ -1514,6 +1547,126 @@ class WindowManager:
             if isinstance(window, FileManagerWindow) and window.modal_active:
                 window.render_modal()
 
+        if self.context_menu_panel is not None:
+            self.render_context_menu()
+
+    def open_context_menu(self, menu_number: int) -> None:
+        definition = self.MENU_DEFINITIONS.get(menu_number)
+        if definition is None:
+            return
+
+        title, items = definition
+        self.close_context_menu()
+        self.context_menu_number = menu_number
+        self.context_menu_items = items
+        self.context_menu_selection = 0
+        screen_height, screen_width = curses.LINES, curses.COLS
+        menu_width = min(screen_width - 2, max(len(title), *(len(label) for label, _ in items)) + 4)
+        menu_height = min(screen_height - 2, len(items) + 2)
+        tab_x = {1: 1, 2: 15, 3: 27}[menu_number]
+        menu_x = min(max(0, screen_width - menu_width), tab_x)
+        menu_y = 1
+
+        self.context_menu_window = curses.newwin(menu_height, menu_width, menu_y, menu_x)
+        self.context_menu_window.keypad(True)
+        self.context_menu_panel = curses.panel.new_panel(self.context_menu_window)
+        self.context_menu_panel.top()
+        self.render_context_menu()
+
+    def close_context_menu(self) -> None:
+        had_menu = self.context_menu_panel is not None
+        if self.context_menu_panel is not None:
+            self.context_menu_panel.hide()
+        self.context_menu_panel = None
+        self.context_menu_window = None
+        self.context_menu_number = None
+        self.context_menu_items = []
+        self.context_menu_selection = 0
+        if had_menu:
+            self.redraw_screen()
+
+    def redraw_screen(self) -> None:
+        if self.stdscr is None:
+            return
+
+        self.stdscr.clearok(True)
+        self.stdscr.erase()
+        display_func(self.stdscr)
+        self.render_windows()
+        curses.panel.update_panels()
+        curses.doupdate()
+
+    def render_context_menu(self) -> None:
+        if self.context_menu_window is None or self.context_menu_panel is None:
+            return
+
+        menu_window = self.context_menu_window
+        _, items = self.MENU_DEFINITIONS[self.context_menu_number]
+        menu_window.erase()
+        menu_window.attron(curses.color_pair(3))
+        for row in range(1, menu_window.getmaxyx()[0] - 1):
+            menu_window.addstr(row, 1, " " * (menu_window.getmaxyx()[1] - 2))
+        menu_window.attroff(curses.color_pair(3))
+        menu_window.attron(curses.color_pair(4))
+        menu_window.box()
+        menu_window.attroff(curses.color_pair(4))
+
+        title = self.MENU_DEFINITIONS[self.context_menu_number][0]
+        try:
+            menu_window.addstr(0, 2, title[: max(0, menu_window.getmaxyx()[1] - 4)], curses.color_pair(2) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        for index, (label, _) in enumerate(items):
+            row = index + 1
+            if row >= menu_window.getmaxyx()[0] - 1:
+                break
+            style = curses.A_REVERSE if index == self.context_menu_selection else curses.A_NORMAL
+            try:
+                menu_window.addstr(row, 1, label[: max(0, menu_window.getmaxyx()[1] - 2)], curses.color_pair(3) | style)
+            except curses.error:
+                pass
+
+        self.context_menu_panel.top()
+        curses.panel.update_panels()
+        curses.doupdate()
+
+    def activate_context_menu_item(self) -> None:
+        if self.context_menu_number is None or not self.context_menu_items:
+            return
+
+        menu_number = self.context_menu_number
+        _, action = self.context_menu_items[self.context_menu_selection]
+        self.close_context_menu()
+
+        if action.startswith("window:"):
+            self.set_active_window(action.partition(":")[2])
+            return
+
+        file_manager = next(
+            (window for window in self.windows.values() if isinstance(window, FileManagerWindow)),
+            None,
+        )
+        if file_manager is None:
+            return
+
+        if action == "create":
+            file_manager.open_create_file_modal()
+            opened = True
+        elif action == "rename":
+            opened = file_manager.open_rename_file_modal()
+        elif action == "copy":
+            opened = file_manager.open_copy_file_modal()
+        elif action == "delete":
+            opened = file_manager.open_delete_file_modal()
+        else:
+            opened = False
+
+        if opened:
+            self.last_active_window_name = self.active_window_name
+            self.modal_window_name = file_manager.title
+            self.active_window_name = None
+
     @staticmethod
     def read_modal_key(window: curses.window) -> int:
         try:
@@ -1570,6 +1723,12 @@ class WindowManager:
             window.timeout(INPUT_POLL_INTERVAL_MS)
 
         encoded = "".join(sequence)
+        alt_tab_keys = {"[49;3u": ALT_TAB_1, "[50;3u": ALT_TAB_2, "[51;3u": ALT_TAB_3}
+        if encoded in alt_tab_keys:
+            return alt_tab_keys[encoded]
+        legacy_alt_keys = {"1": ALT_TAB_1, "2": ALT_TAB_2, "3": ALT_TAB_3}
+        if encoded in legacy_alt_keys:
+            return legacy_alt_keys[encoded]
         if encoded in ("[115;9u", "[83;10u"):
             return COMMAND_S_KEY
         if encoded in ("[122;9u", "[90;9u"):
@@ -1591,6 +1750,25 @@ class WindowManager:
         return key
 
     def handle_input(self) -> bool:
+        if self.context_menu_window is not None:
+            input_window = self.context_menu_window
+            input_window.timeout(INPUT_POLL_INTERVAL_MS)
+            try:
+                key = input_window.getch()
+            except curses.error:
+                key = curses.ERR
+
+            if key == 27:
+                self.close_context_menu()
+            elif key in (curses.KEY_UP, 259):
+                self.context_menu_selection = (self.context_menu_selection - 1) % len(self.context_menu_items)
+            elif key in (curses.KEY_DOWN, 258):
+                self.context_menu_selection = (self.context_menu_selection + 1) % len(self.context_menu_items)
+            elif key in (10, 13, curses.KEY_ENTER):
+                self.activate_context_menu_item()
+            self.render_windows()
+            return True
+
         if self.modal_window_name is not None:
             modal_window = self.windows.get(self.modal_window_name)
             if modal_window is None or not isinstance(modal_window, FileManagerWindow):
@@ -1626,21 +1804,28 @@ class WindowManager:
             return True
 
         active_window = self.get_active_window()
-        if isinstance(active_window, TerminalWindow):
-            input_window = active_window.get_window()
-            input_window.timeout(INPUT_POLL_INTERVAL_MS)
-            key = self.read_terminal_key(input_window)
-            if key == "\x1b":
-                key = 27
-            elif key == "\t":
-                key = 9
-        else:
-            input_window = active_window.get_window()
-            input_window.timeout(INPUT_POLL_INTERVAL_MS)
-            try:
-                key = input_window.getch()
-            except curses.error:
-                key = curses.ERR
+        input_window = active_window.get_window()
+        input_window.timeout(INPUT_POLL_INTERVAL_MS)
+        key = self.read_terminal_key(input_window)
+        if key == "\x1b":
+            key = 27
+        elif key == "\t":
+            key = 9
+        elif isinstance(key, str) and len(key) == 1:
+            key = ord(key)
+
+        context_menu_number = {
+            ALT_TAB_1: 1,
+            ALT_TAB_2: 2,
+            ALT_TAB_3: 3,
+            curses.KEY_F9: 1,
+            curses.KEY_F10: 2,
+            curses.KEY_F11: 3,
+        }.get(key)
+        if context_menu_number is not None:
+            self.open_context_menu(context_menu_number)
+            self.render_windows()
+            return True
 
         if key == 27:   # Escape key
             return False
@@ -1717,7 +1902,7 @@ class WindowManager:
 
 def display_func(stdscr: curses.window) -> None:
     try:
-        stdscr.addstr(0, 1, "Left panel    Settings    Right panel")
+        stdscr.addstr(0, 1, "Left panel [Alt+1/F9]    Settings [Alt+2/F10]    Right panel [Alt+3/F11]")
 
         row = curses.LINES - 2
         width = curses.COLS
@@ -1764,7 +1949,7 @@ def run(stdscr: curses.window) -> None:
     columns = curses.COLS
     lines = curses.LINES
 
-    window_manager = WindowManager()
+    window_manager = WindowManager(stdscr)
     terminal_window = TerminalWindow(int(columns * 0.25), 2, int(columns * 0.75), lines - 3, "Terminal")
     window_manager.add_window(FileManagerWindow(0, 2, int(columns * 0.25), lines - 3, "Files", path, terminal_window))
     window_manager.add_window(terminal_window)
