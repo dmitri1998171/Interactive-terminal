@@ -1713,6 +1713,13 @@ class WindowManager:
 
         return False
 
+    def activate_window_at(self, mouse_x: int, mouse_y: int) -> bool:
+        for name, window in self.windows.items():
+            if window.x1 <= mouse_x < window.x2 and window.y1 <= mouse_y < window.y2:
+                self.active_window_name = name
+                return True
+        return False
+
     @staticmethod
     def read_modal_key(window: curses.window) -> int:
         try:
@@ -1894,6 +1901,9 @@ class WindowManager:
                 context_menu_number = top_tab_menu_at(mouse_x, mouse_y)
                 if context_menu_number is not None:
                     self.open_context_menu(context_menu_number)
+                    self.render_windows()
+                    return True
+                if self.activate_window_at(mouse_x, mouse_y):
                     self.render_windows()
                     return True
 
