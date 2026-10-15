@@ -32,10 +32,7 @@ SHIFT_ARROW_UP = -5
 SHIFT_ARROW_DOWN = -6
 SHIFT_ARROW_LEFT = -7
 SHIFT_ARROW_RIGHT = -8
-TOP_BAR_TEXT = "Left panel [Alt+1/F9]    Settings [Alt+2/F10]    Right panel [Alt+3/F11]"
-ALT_TAB_1 = -20
-ALT_TAB_2 = -21
-ALT_TAB_3 = -22
+TOP_BAR_TEXT = "Left panel    Settings    Right panel"
 
 
 def log_info(value: object) -> None:
@@ -1742,12 +1739,6 @@ class WindowManager:
             window.timeout(INPUT_POLL_INTERVAL_MS)
 
         encoded = "".join(sequence)
-        alt_tab_keys = {"[49;3u": ALT_TAB_1, "[50;3u": ALT_TAB_2, "[51;3u": ALT_TAB_3}
-        if encoded in alt_tab_keys:
-            return alt_tab_keys[encoded]
-        legacy_alt_keys = {"1": ALT_TAB_1, "2": ALT_TAB_2, "3": ALT_TAB_3}
-        if encoded in legacy_alt_keys:
-            return legacy_alt_keys[encoded]
         if encoded in ("[115;9u", "[83;10u"):
             return COMMAND_S_KEY
         if encoded in ("[122;9u", "[90;9u"):
@@ -1766,7 +1757,7 @@ class WindowManager:
         }
         if encoded in shifted_arrow_sequences:
             return shifted_arrow_sequences[encoded]
-        return key
+        return curses.ERR if sequence else key
 
     def handle_input(self) -> bool:
         if self.context_menu_window is not None:
@@ -1794,7 +1785,13 @@ class WindowManager:
                         menu_x < mouse_x < menu_x + menu_width - 1
                         and 0 <= item_index < len(self.context_menu_items)
                     )
-                    if clicked_item:
+                    clicked_tab = top_tab_menu_at(mouse_x, mouse_y)
+                    if clicked_tab is not None:
+                        if clicked_tab == self.context_menu_number:
+                            self.close_context_menu()
+                        else:
+                            self.open_context_menu(clicked_tab)
+                    elif clicked_item:
                         self.context_menu_selection = item_index
                         self.activate_context_menu_item()
                     else:
@@ -1852,19 +1849,6 @@ class WindowManager:
             key = 9
         elif isinstance(key, str) and len(key) == 1:
             key = ord(key)
-
-        context_menu_number = {
-            ALT_TAB_1: 1,
-            ALT_TAB_2: 2,
-            ALT_TAB_3: 3,
-            curses.KEY_F9: 1,
-            curses.KEY_F10: 2,
-            curses.KEY_F11: 3,
-        }.get(key)
-        if context_menu_number is not None:
-            self.open_context_menu(context_menu_number)
-            self.render_windows()
-            return True
 
         if key == curses.KEY_MOUSE:
             try:
