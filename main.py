@@ -32,6 +32,7 @@ SHIFT_ARROW_UP = -5
 SHIFT_ARROW_DOWN = -6
 SHIFT_ARROW_LEFT = -7
 SHIFT_ARROW_RIGHT = -8
+TOP_BAR_TEXT = "Left panel [Alt+1/F9]    Settings [Alt+2/F10]    Right panel [Alt+3/F11]"
 ALT_TAB_1 = -20
 ALT_TAB_2 = -21
 ALT_TAB_3 = -22
@@ -54,6 +55,19 @@ def right_panel_geometry(columns: int, lines: int) -> list[tuple[int, int, int, 
         (x1, y1 + panel_height * index, columns, y1 + panel_height * (index + 1))
         for index in range(3)
     ]
+
+
+def top_tab_menu_at(x: int, y: int) -> int | None:
+    if y != 0:
+        return None
+
+    tabs = ((1, "Left panel"), (2, "Settings"), (3, "Right panel"))
+    starts = [1 + TOP_BAR_TEXT.index(label) for _, label in tabs]
+    ends = starts[1:] + [1 + len(TOP_BAR_TEXT)]
+    for (menu_number, _), start, end in zip(tabs, starts, ends):
+        if start <= x < end:
+            return menu_number
+    return None
 
 
 def curses_color(fg: int) -> int:
@@ -88,6 +102,10 @@ def init_terminal() -> None:
     curses.start_color()
     curses.noecho()
     curses.cbreak()
+    try:
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    except curses.error:
+        pass
     try:
         terminal_attributes = termios.tcgetattr(sys.stdin.fileno())
         terminal_attributes[0] &= ~termios.IXON
@@ -1563,7 +1581,8 @@ class WindowManager:
         screen_height, screen_width = curses.LINES, curses.COLS
         menu_width = min(screen_width - 2, max(len(title), *(len(label) for label, _ in items)) + 4)
         menu_height = min(screen_height - 2, len(items) + 2)
-        tab_x = {1: 1, 2: 15, 3: 27}[menu_number]
+        tab_labels = {1: "Left panel", 2: "Settings", 3: "Right panel"}
+        tab_x = 1 + TOP_BAR_TEXT.index(tab_labels[menu_number])
         menu_x = min(max(0, screen_width - menu_width), tab_x)
         menu_y = 1
 
@@ -1760,6 +1779,26 @@ class WindowManager:
 
             if key == 27:
                 self.close_context_menu()
+            elif key == curses.KEY_MOUSE:
+                try:
+                    _, mouse_x, mouse_y, _, button_state = curses.getmouse()
+                except curses.error:
+                    mouse_x = mouse_y = -1
+                    button_state = 0
+                left_click = getattr(curses, "BUTTON1_CLICKED", 0) | getattr(curses, "BUTTON1_PRESSED", 0)
+                if button_state & left_click:
+                    menu_y, menu_x = input_window.getbegyx()
+                    menu_height, menu_width = input_window.getmaxyx()
+                    item_index = mouse_y - menu_y - 1
+                    clicked_item = (
+                        menu_x < mouse_x < menu_x + menu_width - 1
+                        and 0 <= item_index < len(self.context_menu_items)
+                    )
+                    if clicked_item:
+                        self.context_menu_selection = item_index
+                        self.activate_context_menu_item()
+                    else:
+                        self.close_context_menu()
             elif key in (curses.KEY_UP, 259):
                 self.context_menu_selection = (self.context_menu_selection - 1) % len(self.context_menu_items)
             elif key in (curses.KEY_DOWN, 258):
@@ -1826,6 +1865,20 @@ class WindowManager:
             self.open_context_menu(context_menu_number)
             self.render_windows()
             return True
+
+        if key == curses.KEY_MOUSE:
+            try:
+                _, mouse_x, mouse_y, _, button_state = curses.getmouse()
+            except curses.error:
+                button_state = 0
+                mouse_x = mouse_y = -1
+            left_click = getattr(curses, "BUTTON1_CLICKED", 0) | getattr(curses, "BUTTON1_PRESSED", 0)
+            if button_state & left_click:
+                context_menu_number = top_tab_menu_at(mouse_x, mouse_y)
+                if context_menu_number is not None:
+                    self.open_context_menu(context_menu_number)
+                    self.render_windows()
+                    return True
 
         if key == 27:   # Escape key
             return False
@@ -1902,7 +1955,7 @@ class WindowManager:
 
 def display_func(stdscr: curses.window) -> None:
     try:
-        stdscr.addstr(0, 1, "Left panel [Alt+1/F9]    Settings [Alt+2/F10]    Right panel [Alt+3/F11]")
+        stdscr.addstr(0, 1, TOP_BAR_TEXT[: max(0, curses.COLS - 2)])
 
         row = curses.LINES - 2
         width = curses.COLS
