@@ -67,6 +67,53 @@ def top_tab_menu_at(x: int, y: int) -> int | None:
     return None
 
 
+def bottom_bar_labels(width: int) -> list[tuple[int, str, str]]:
+    labels = [
+        (1, "Tab", "next"),
+        (11, "Shift+Tab", "prev"),
+        (26, "Esc", "quit"),
+    ]
+
+    if width > 100:
+        labels = [
+            (1, "Tab", "след. окно"),
+            (17, "Shift+Tab", "пред. окно"),
+            (39, "Esc", "Выход"),
+            (50, "F1", "Создать"),
+            (62, "F2", "Переим."),
+            (74, "F3", "Копия"),
+            (84, "F8", "Удалить"),
+            (96, "F5", "Undo"),
+            (105, "F6", "Redo"),
+        ]
+
+    return labels
+
+
+BOTTOM_BAR_KEY_CODES = {
+    "Tab": 9,
+    "Shift+Tab": curses.KEY_BTAB,
+    "Esc": 27,
+    "F1": curses.KEY_F1,
+    "F2": curses.KEY_F2,
+    "F3": curses.KEY_F3,
+    "F5": curses.KEY_F5,
+    "F6": curses.KEY_F6,
+    "F8": curses.KEY_F8,
+}
+
+
+def bottom_bar_at(x: int, y: int) -> int | None:
+    if y != curses.LINES - 2:
+        return None
+
+    for column, key_label, description in bottom_bar_labels(curses.COLS):
+        end = column + len(key_label) + 1 + len(f"-{description}")
+        if column <= x < end:
+            return BOTTOM_BAR_KEY_CODES.get(key_label)
+    return None
+
+
 def curses_color(fg: int) -> int:
     colors = (
         curses.COLOR_BLACK,
@@ -1895,15 +1942,17 @@ class WindowManager:
                 mouse_x = mouse_y = -1
             left_click = getattr(curses, "BUTTON1_CLICKED", 0) | getattr(curses, "BUTTON1_PRESSED", 0)
             if button_state & left_click:
-                if self.handle_files_mouse_click(mouse_x, mouse_y, button_state):
+                bottom_key = bottom_bar_at(mouse_x, mouse_y)
+                if bottom_key is not None:
+                    key = bottom_key
+                elif self.handle_files_mouse_click(mouse_x, mouse_y, button_state):
                     self.render_windows()
                     return True
-                context_menu_number = top_tab_menu_at(mouse_x, mouse_y)
-                if context_menu_number is not None:
+                elif (context_menu_number := top_tab_menu_at(mouse_x, mouse_y)) is not None:
                     self.open_context_menu(context_menu_number)
                     self.render_windows()
                     return True
-                if self.activate_window_at(mouse_x, mouse_y):
+                elif self.activate_window_at(mouse_x, mouse_y):
                     self.render_windows()
                     return True
 
@@ -1986,24 +2035,7 @@ def display_func(stdscr: curses.window) -> None:
 
         row = curses.LINES - 2
         width = curses.COLS
-        labels = [
-            (1, "Tab", "next"),
-            (11, "Shift+Tab", "prev"),
-            (26, "Esc", "quit"),
-        ]
-
-        if width > 100:
-            labels = [
-                (1, "Tab", "след. окно"),
-                (17, "Shift+Tab", "пред. окно"),
-                (39, "Esc", "Выход"),
-                (50, "F1", "Создать"),
-                (62, "F2", "Переим."),
-                (74, "F3", "Копия"),
-                (84, "F8", "Удалить"),
-                (96, "F5", "Undo"),
-                (105, "F6", "Redo"),
-            ]
+        labels = bottom_bar_labels(width)
 
         for column, key, description in labels:
             if column >= width:
