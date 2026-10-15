@@ -709,6 +709,31 @@ class NetworkInfoWindow(Window):
 
 
 class TerminalWindow(Window):
+    STATUS_BUTTONS: tuple[tuple[str, int], ...] = (
+        ("F2 save", curses.KEY_F2),
+        ("F3 paste", curses.KEY_F3),
+        ("F4 copy", curses.KEY_F4),
+        ("F5 undo", curses.KEY_F5),
+        ("F6 redo", curses.KEY_F6),
+    )
+
+    @classmethod
+    def status_bar_text(cls, dirty: bool) -> str:
+        return "  ".join(label for label, _ in cls.STATUS_BUTTONS) + (" *" if dirty else "")
+
+    def status_button_at(self, mouse_x: int, mouse_y: int) -> int | None:
+        if mouse_y != self.y1 + self.height - 1:
+            return None
+        if self.file_path is None or self.save_error:
+            return None
+
+        column = self.x1 + 2
+        for label, key_code in self.STATUS_BUTTONS:
+            if column <= mouse_x < column + len(label):
+                return key_code
+            column += len(label) + 2
+        return None
+
     def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str) -> None:
         super().__init__(x1, y1, x2, y2, title)
         self.content_lines: list[str] = [""]
@@ -932,7 +957,7 @@ class TerminalWindow(Window):
         location = ""
         status = ""
         if active and self.file_path is not None:
-            status = "F2 save  F3 paste  F4 copy  F5 undo  F6 redo" + (" *" if self.dirty else "")
+            status = self.status_bar_text(self.dirty)
             if self.save_error:
                 status = self.save_error
             location = f"Ln {self.cursor_row + 1}, Col {self.cursor_column + 1}"
@@ -1945,6 +1970,11 @@ class WindowManager:
                 bottom_key = bottom_bar_at(mouse_x, mouse_y)
                 if bottom_key is not None:
                     key = bottom_key
+                elif (
+                    isinstance(active_window, TerminalWindow)
+                    and (editor_key := active_window.status_button_at(mouse_x, mouse_y)) is not None
+                ):
+                    key = editor_key
                 elif self.handle_files_mouse_click(mouse_x, mouse_y, button_state):
                     self.render_windows()
                     return True
