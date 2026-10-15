@@ -1683,6 +1683,36 @@ class WindowManager:
             self.modal_window_name = file_manager.title
             self.active_window_name = None
 
+    def handle_files_mouse_click(self, mouse_x: int, mouse_y: int, button_state: int) -> bool:
+        click_mask = (
+            getattr(curses, "BUTTON1_CLICKED", 0)
+            | getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0)
+        )
+        if not click_mask or not button_state & click_mask:
+            return False
+
+        for window in self.windows.values():
+            if not isinstance(window, FileManagerWindow):
+                continue
+            if not (window.x1 < mouse_x < window.x2 - 1):
+                continue
+
+            entry_index = mouse_y - window.y1 - 2
+            if not 0 <= entry_index < min(len(window.entries), max(0, window.height - 4)):
+                continue
+
+            window.selected_index = entry_index
+            self.active_window_name = window.title
+            _, kind = window.entries[entry_index]
+            window.handle_key(curses.KEY_ENTER)
+            if kind == "file" and window.terminal_window is not None:
+                terminal_window = window.terminal_window
+                if self.windows.get(terminal_window.title) is terminal_window:
+                    self.active_window_name = terminal_window.title
+            return True
+
+        return False
+
     @staticmethod
     def read_modal_key(window: curses.window) -> int:
         try:
@@ -1858,6 +1888,9 @@ class WindowManager:
                 mouse_x = mouse_y = -1
             left_click = getattr(curses, "BUTTON1_CLICKED", 0) | getattr(curses, "BUTTON1_PRESSED", 0)
             if button_state & left_click:
+                if self.handle_files_mouse_click(mouse_x, mouse_y, button_state):
+                    self.render_windows()
+                    return True
                 context_menu_number = top_tab_menu_at(mouse_x, mouse_y)
                 if context_menu_number is not None:
                     self.open_context_menu(context_menu_number)
