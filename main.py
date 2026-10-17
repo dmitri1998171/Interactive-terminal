@@ -48,8 +48,9 @@ def right_panel_geometry(columns: int, lines: int) -> list[tuple[int, int, int, 
     x1 = int(columns * 0.75)
     y1 = max(7, int(lines * 0.125) - 1)
     panel_height = max(1, (lines - 3 - y1) // 3)
+    # Bottom (Network info) panel gets one extra row to fit the traffic block
     return [
-        (x1, y1 + panel_height * index, columns, y1 + panel_height * (index + 1))
+        (x1, y1 + panel_height * index, columns, y1 + panel_height * (index + 1) + (1 if index == 2 else 0))
         for index in range(3)
     ]
 
@@ -694,9 +695,11 @@ class NetworkInfoWindow(Window):
         current_download = download_values[-1] if download_values else 0.0
         current_upload = upload_values[-1] if upload_values else 0.0
         traffic_rows = (
+            (self.height - 5, ""),
             (self.height - 4, "Traffic (recent)"),
             (self.height - 3, f"Down {self.format_rate(current_download)} {self.sparkline(download_values, graph_width)}"),
             (self.height - 2, f"Up   {self.format_rate(current_upload)} {self.sparkline(upload_values, graph_width)}"),
+            (self.height - 1, ""),
         )
         for row, line in traffic_rows:
             if row < 1:
