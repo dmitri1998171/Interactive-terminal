@@ -32,7 +32,7 @@ SHIFT_ARROW_UP = -5
 SHIFT_ARROW_DOWN = -6
 SHIFT_ARROW_LEFT = -7
 SHIFT_ARROW_RIGHT = -8
-TOP_BAR_TEXT = "Left panel    Settings    Right panel"
+TOP_BAR_TEXT = "Files    Settings"
 
 
 def log_info(value: object) -> None:
@@ -59,7 +59,7 @@ def top_tab_menu_at(x: int, y: int) -> int | None:
     if y != 0:
         return None
 
-    tabs = ((1, "Left panel"), (2, "Settings"), (3, "Right panel"))
+    tabs = ((1, "Files"), (2, "Settings"))
     starts = [1 + TOP_BAR_TEXT.index(label) for _, label in tabs]
     ends = starts[1:] + [1 + len(TOP_BAR_TEXT)]
     for (menu_number, _), start, end in zip(tabs, starts, ends):
@@ -1101,6 +1101,7 @@ class FileManagerWindow(Window):
         self.selected_index = 0
         self.entries: list[tuple[str, str]] = []
         self.terminal_window = terminal_window
+        self.preview_enabled = False
         self.modal_active = False
         self.modal_input = ""
         self.modal_cursor = 0
@@ -1484,7 +1485,47 @@ class FileManagerWindow(Window):
             self.modal_cursor += 1
             self.modal_error = ""
 
-    def handle_key(self, key: int) -> None:
+    TEXT_EXTENSIONS = frozenset({
+        ".txt", ".md", ".rst", ".log", ".csv", ".tsv", ".json", ".yaml", ".yml",
+        ".toml", ".ini", ".cfg", ".conf", ".xml", ".html", ".htm", ".css", ".scss",
+        ".sass", ".less", ".js", ".ts", ".jsx", ".tsx", ".py", ".pyw", ".rb", ".php",
+        ".java", ".kt", ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".cs", ".go",
+        ".rs", ".swift", ".m", ".mm", ".sh", ".bash", ".zsh", ".fish", ".bat",
+        ".cmd", ".ps1", ".sql", ".r", ".lua", ".pl", ".pm", ".tcl", ".vim", ".el",
+        ".tex", ".srt", ".vtt", ".svg", ".properties", ".env", ".gitignore",
+        ".dockerignore", ".editorconfig", ".eslintrc", ".prettierrc", ".lock",
+    })
+
+    @classmethod
+    def is_text_file(cls, file_path: str) -> bool:
+        _, ext = os.path.splitext(file_path)
+        return ext.lower() in cls.TEXT_EXTENSIONS or ext == ""
+
+    def preview_file(self) -> None:
+        if not self.entries or self.selected_index >= len(self.entries):
+            return
+        name, kind = self.entries[self.selected_index]
+        if kind == "dir" or self.terminal_window is None:
+            return
+        file_path = os.path.join(self.current_path, name)
+        if not self.is_text_file(file_path):
+            return
+        loaded_file_path: str | None = None
+        try:
+            with open(file_path, "r", encoding="utf-8") as file:
+                text = file.read()
+            loaded_file_path = file_path
+        except UnicodeDecodeError:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as file:
+                text = file.read()
+            loaded_file_path = file_path
+        except OSError:
+            text = f"Unable to read file: {file_path}"
+        self.terminal_window.set_content(text, loaded_file_path)
+
+    def handle_key(self, key: int | str) -> None:
+        if isinstance(key, str):
+            return
         if key == curses.KEY_F1:
             self.open_create_file_modal()
             self.render()
@@ -1494,14 +1535,22 @@ class FileManagerWindow(Window):
             self.render()
             return
 
+        navigated = False
         if key == curses.KEY_PPAGE:
             self.selected_index = 0
+            navigated = True
         elif key == curses.KEY_NPAGE:
             self.selected_index = max(0, len(self.entries) - 1)
+            navigated = True
         elif key in (curses.KEY_UP, 259, 65):
             self.selected_index = max(0, self.selected_index - 1)
+            navigated = True
         elif key in (curses.KEY_DOWN, 258, 66):
             self.selected_index = min(len(self.entries) - 1, self.selected_index + 1)
+            navigated = True
+
+        if navigated and self.preview_enabled:
+            self.preview_file()
         elif key in (10, 13, curses.KEY_ENTER):
             if not self.entries:
                 return
@@ -1515,6 +1564,8 @@ class FileManagerWindow(Window):
                 self.refresh_content()
             elif kind == "file" and self.terminal_window is not None:
                 file_path = os.path.join(self.current_path, name)
+                if not self.is_text_file(file_path):
+                    return
                 loaded_file_path: str | None = None
                 try:
                     with open(file_path, "r", encoding="utf-8") as file:
@@ -1541,7 +1592,7 @@ class WindowManager:
     NON_SWITCHABLE_WINDOWS = {"Clock", "Date", "System info", "Hardware info", "Network info"}
 
     MENU_DEFINITIONS = {
-        1: ("Left panel", [("Files", "window:Files"), ("Terminal", "window:Terminal")]),
+        1: ("Files", [("Превью при пролистывании", "preview_toggle")]),
         2: (
             "Settings",
             [
@@ -1549,16 +1600,6 @@ class WindowManager:
                 ("Move / rename", "rename"),
                 ("Copy", "copy"),
                 ("Delete", "delete"),
-            ],
-        ),
-        3: (
-            "Right panel",
-            [
-                ("Clock", "window:Clock"),
-                ("Date", "window:Date"),
-                ("System info", "window:System info"),
-                ("Hardware info", "window:Hardware info"),
-                ("Network info", "window:Network info"),
             ],
         ),
     }
@@ -1652,8 +1693,9 @@ class WindowManager:
         self.context_menu_selection = 0
         screen_height, screen_width = curses.LINES, curses.COLS
         menu_width = min(screen_width - 2, max(len(title), *(len(label) for label, _ in items)) + 4)
-        menu_height = min(screen_height - 2, len(items) + 2)
-        tab_labels = {1: "Left panel", 2: "Settings", 3: "Right panel"}
+        item_line_counts = [self.count_wrap_lines(label, menu_width - 4) for label, _ in items]
+        menu_height = min(screen_height - 2, sum(item_line_counts) + len(items) + 2)
+        tab_labels = {1: "Files", 2: "Settings"}
         tab_x = 1 + TOP_BAR_TEXT.index(tab_labels[menu_number])
         menu_x = min(max(0, screen_width - menu_width), tab_x)
         menu_y = 1
@@ -1687,6 +1729,58 @@ class WindowManager:
         curses.panel.update_panels()
         curses.doupdate()
 
+    @staticmethod
+    def count_wrap_lines(text: str, max_width: int) -> int:
+        if max_width <= 0 or not text:
+            return 1
+        words = text.split()
+        lines = 0
+        current_len = 0
+        for word in words:
+            if current_len == 0:
+                if len(word) <= max_width:
+                    current_len = len(word)
+                else:
+                    lines += 1
+                    remaining = len(word)
+                    lines += (remaining + max_width - 1) // max_width
+                    current_len = 0
+            elif current_len + 1 + len(word) <= max_width:
+                current_len += 1 + len(word)
+            else:
+                lines += 1
+                current_len = len(word)
+        if current_len > 0:
+            lines += 1
+        return max(lines, 1)
+
+    @staticmethod
+    def wrap_text(text: str, max_width: int) -> list[str]:
+        if max_width <= 0 or not text:
+            return [text]
+        words = text.split()
+        lines: list[str] = []
+        current_line = ""
+        for word in words:
+            if not current_line:
+                if len(word) <= max_width:
+                    current_line = word
+                else:
+                    while word:
+                        lines.append(word[:max_width])
+                        word = word[max_width:]
+                    current_line = ""
+            elif len(current_line) + 1 + len(word) <= max_width:
+                current_line += " " + word
+            else:
+                lines.append(current_line)
+                current_line = word
+        if current_line:
+            lines.append(current_line)
+        if not lines:
+            lines = [""]
+        return lines
+
     def render_context_menu(self) -> None:
         if self.context_menu_window is None or self.context_menu_panel is None:
             return
@@ -1708,15 +1802,27 @@ class WindowManager:
         except curses.error:
             pass
 
-        for index, (label, _) in enumerate(items):
-            row = index + 1
+        menu_content_width = max(0, menu_window.getmaxyx()[1] - 4)
+        file_manager = next(
+            (window for window in self.windows.values() if isinstance(window, FileManagerWindow)),
+            None,
+        )
+        row = 1
+        for index, (label, action) in enumerate(items):
+            if action == "preview_toggle" and file_manager is not None and file_manager.preview_enabled:
+                label = "* " + label
+            wrapped_lines = self.wrap_text(label, menu_content_width)
+            for line_idx, wrapped_line in enumerate(wrapped_lines):
+                if row >= menu_window.getmaxyx()[0] - 1:
+                    break
+                style = curses.A_REVERSE if index == self.context_menu_selection and line_idx == 0 else curses.A_NORMAL
+                try:
+                    menu_window.addstr(row, 1, wrapped_line[: max(0, menu_window.getmaxyx()[1] - 2)], curses.color_pair(3) | style)
+                except curses.error:
+                    pass
+                row += 1
             if row >= menu_window.getmaxyx()[0] - 1:
                 break
-            style = curses.A_REVERSE if index == self.context_menu_selection else curses.A_NORMAL
-            try:
-                menu_window.addstr(row, 1, label[: max(0, menu_window.getmaxyx()[1] - 2)], curses.color_pair(3) | style)
-            except curses.error:
-                pass
 
         self.context_menu_panel.top()
         curses.panel.update_panels()
@@ -1750,6 +1856,10 @@ class WindowManager:
             opened = file_manager.open_copy_file_modal()
         elif action == "delete":
             opened = file_manager.open_delete_file_modal()
+        elif action == "preview_toggle":
+            file_manager.preview_enabled = not file_manager.preview_enabled
+            self.active_window_name = file_manager.title
+            opened = False
         else:
             opened = False
 
@@ -1957,9 +2067,9 @@ class WindowManager:
         key = self.read_terminal_key(input_window)
         if key == "\x1b":
             key = 27
-        elif key == "\t":
+        elif key == "	":
             key = 9
-        elif isinstance(key, str) and len(key) == 1:
+        elif isinstance(key, str) and len(key) == 1 and not key.isprintable():
             key = ord(key)
 
         if key == curses.KEY_MOUSE:
