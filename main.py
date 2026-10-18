@@ -1591,8 +1591,17 @@ class FileManagerWindow(Window):
 class WindowManager:
     NON_SWITCHABLE_WINDOWS = {"Clock", "Date", "System info", "Hardware info", "Network info"}
 
+    COPY_MOVE_MODAL = "модал. окно"
+    COPY_MOVE_TWO_WINDOWS = "два окна"
+
     MENU_DEFINITIONS = {
-        1: ("Files", [("Превью при пролистывании", "preview_toggle")]),
+        1: (
+            "Files",
+            [
+                ("Превью при пролистывании", "preview_toggle"),
+                ("Режим копир./перемещ.: модал. окно", "copy_move_mode_toggle"),
+            ],
+        ),
         2: (
             "Settings",
             [
@@ -1615,6 +1624,7 @@ class WindowManager:
         self.context_menu_selection = 0
         self.context_menu_window: curses.window | None = None
         self.context_menu_panel: curses.panel.panel | None = None
+        self.copy_move_mode = self.COPY_MOVE_MODAL
 
     def add_window(self, window: Window) -> None:
         if window.title in self.windows:
@@ -1681,6 +1691,11 @@ class WindowManager:
         if self.context_menu_panel is not None:
             self.render_context_menu()
 
+    def resolve_menu_label(self, label: str, action: str) -> str:
+        if action == "copy_move_mode_toggle":
+            return f"Режим копир./перемещ.: {self.copy_move_mode}"
+        return label
+
     def open_context_menu(self, menu_number: int) -> None:
         definition = self.MENU_DEFINITIONS.get(menu_number)
         if definition is None:
@@ -1692,8 +1707,9 @@ class WindowManager:
         self.context_menu_items = items
         self.context_menu_selection = 0
         screen_height, screen_width = curses.LINES, curses.COLS
-        menu_width = min(screen_width - 2, max(len(title), *(len(label) for label, _ in items)) + 4)
-        item_line_counts = [self.count_wrap_lines(label, menu_width - 4) for label, _ in items]
+        resolved_labels = [self.resolve_menu_label(label, action) for label, action in items]
+        menu_width = min(screen_width - 2, max(len(title), *(len(lbl) for lbl in resolved_labels)) + 4)
+        item_line_counts = [self.count_wrap_lines(lbl, menu_width - 4) for lbl in resolved_labels]
         menu_height = min(screen_height - 2, sum(item_line_counts) + len(items) + 2)
         tab_labels = {1: "Files", 2: "Settings"}
         tab_x = 1 + TOP_BAR_TEXT.index(tab_labels[menu_number])
@@ -1809,6 +1825,7 @@ class WindowManager:
         )
         row = 1
         for index, (label, action) in enumerate(items):
+            label = self.resolve_menu_label(label, action)
             if action == "preview_toggle" and file_manager is not None and file_manager.preview_enabled:
                 label = "* " + label
             wrapped_lines = self.wrap_text(label, menu_content_width)
@@ -1859,6 +1876,12 @@ class WindowManager:
         elif action == "preview_toggle":
             file_manager.preview_enabled = not file_manager.preview_enabled
             self.active_window_name = file_manager.title
+            opened = False
+        elif action == "copy_move_mode_toggle":
+            if self.copy_move_mode == self.COPY_MOVE_MODAL:
+                self.copy_move_mode = self.COPY_MOVE_TWO_WINDOWS
+            else:
+                self.copy_move_mode = self.COPY_MOVE_MODAL
             opened = False
         else:
             opened = False
