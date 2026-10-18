@@ -12,3 +12,4 @@ log.log
 .DS_Store
 
 test.py
+test_folder/

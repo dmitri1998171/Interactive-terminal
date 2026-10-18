@@ -751,6 +751,17 @@ class TerminalWindow(Window):
         self.saved_content_lines = self.content_lines.copy()
         self.undo_history: list[tuple[list[str], int, int, tuple[int, int] | None]] = []
         self.redo_history: list[tuple[list[str], int, int, tuple[int, int] | None]] = []
+        self.file_operation_active = False
+        self.file_operation_type: str = ""
+        self.file_operation_source: str = ""
+        self.file_operation_source_is_dir = False
+        self.file_operation_dest_dir: str = ""
+        self.file_operation_entries: list[tuple[str, str]] = []
+        self.file_operation_selected_index = 0
+        self.file_operation_input = ""
+        self.file_operation_input_cursor = 0
+        self.file_operation_error = ""
+        self.file_operation_input_focused = False
         self.render()
 
     def set_content(self, text: str, file_path: str | None = None) -> None:
@@ -792,6 +803,292 @@ class TerminalWindow(Window):
         if len(self.undo_history) > 100:
             del self.undo_history[0]
         self.redo_history.clear()
+
+    def start_file_operation(self, operation_type: str, source_path: str) -> None:
+        self.file_operation_active = True
+        self.file_operation_type = operation_type
+        self.file_operation_source = source_path
+        self.file_operation_source_is_dir = os.path.isdir(source_path) and not os.path.islink(source_path)
+        self.file_operation_dest_dir = os.path.dirname(source_path)
+        self.file_operation_selected_index = 0
+        self.file_operation_input = os.path.basename(source_path)
+        self.file_operation_input_cursor = len(self.file_operation_input)
+        self.file_operation_error = ""
+        self.file_operation_input_focused = False
+        self.refresh_file_operation_entries()
+
+    def refresh_file_operation_entries(self) -> None:
+        self.file_operation_entries = []
+        parent = os.path.dirname(self.file_operation_dest_dir)
+        if parent and self.file_operation_dest_dir != parent:
+            self.file_operation_entries.append(("..", "dir"))
+        try:
+            items = sorted(
+                os.scandir(self.file_operation_dest_dir),
+                key=lambda entry: (not entry.is_dir(), entry.name.lower()),
+            )
+        except OSError:
+            self.file_operation_dest_dir = os.getcwd()
+            self.file_operation_entries = [("..", "dir")]
+            items = sorted(
+                os.scandir(self.file_operation_dest_dir),
+                key=lambda entry: (not entry.is_dir(), entry.name.lower()),
+            )
+        for entry in items:
+            kind = "dir" if entry.is_dir() else "file"
+            self.file_operation_entries.append((entry.name, kind))
+        if self.file_operation_selected_index >= len(self.file_operation_entries):
+            self.file_operation_selected_index = max(0, len(self.file_operation_entries) - 1)
+
+    def finish_file_operation(self) -> None:
+        self.file_operation_active = False
+        self.file_operation_type = ""
+        self.file_operation_source = ""
+        self.file_operation_source_is_dir = False
+        self.file_operation_dest_dir = ""
+        self.file_operation_entries = []
+        self.file_operation_selected_index = 0
+        self.file_operation_input = ""
+        self.file_operation_input_cursor = 0
+        self.file_operation_error = ""
+
+    def execute_file_operation(self, destination_path: str) -> None:
+        source_path = os.path.abspath(self.file_operation_source)
+        destination_path = os.path.abspath(destination_path)
+        destination_name = os.path.basename(destination_path)
+        if destination_name in {"", ".", ".."}:
+            self.file_operation_error = "Invalid destination file name"
+            return
+        if not os.path.isdir(os.path.dirname(destination_path)):
+            self.file_operation_error = "Destination folder does not exist"
+            return
+        if destination_path == source_path:
+            if self.file_operation_type == "copy":
+                self.file_operation_error = "Source and destination are identical"
+                return
+            self.finish_file_operation()
+            return
+        if self.file_operation_source_is_dir and not os.path.islink(source_path):
+            if os.path.commonpath((source_path, destination_path)) == source_path:
+                action_verb = "copy" if self.file_operation_type == "copy" else "move"
+                self.file_operation_error = f"Cannot {action_verb} folder into itself"
+                return
+        if os.path.lexists(destination_path):
+            self.file_operation_error = "Destination already exists"
+            return
+        try:
+            if self.file_operation_type == "copy":
+                if self.file_operation_source_is_dir:
+                    if os.path.islink(source_path):
+                        os.symlink(os.readlink(source_path), destination_path)
+                    else:
+                        shutil.copytree(source_path, destination_path)
+                else:
+                    shutil.copy2(source_path, destination_path)
+            else:
+                shutil.move(source_path, destination_path)
+        except (OSError, shutil.Error):
+            if self.file_operation_type == "copy":
+                self.file_operation_error = "Failed to copy folder" if self.file_operation_source_is_dir else "Failed to copy file"
+            else:
+                self.file_operation_error = "Failed to move or rename folder" if self.file_operation_source_is_dir else "Failed to move or rename file"
+            return
+        self.finish_file_operation()
+
+    def render_file_operation(self) -> None:
+        if not self.file_operation_active:
+            return
+        self.window.erase()
+        border_color = curses.color_pair(4)
+        self.window.attron(border_color)
+        self.window.box()
+        self.window.attroff(border_color)
+        title_text = "Copy file" if self.file_operation_type == "copy" else "Move / rename file"
+        if self.file_operation_source_is_dir:
+            title_text = "Copy folder" if self.file_operation_type == "copy" else "Move / rename folder"
+        try:
+            title_x = max(1, (self.width - len(title_text)) // 2)
+            self.window.attron(curses.color_pair(2) | curses.A_BOLD)
+            self.window.addstr(0, title_x, title_text[: max(0, self.width - 2)])
+            self.window.attroff(curses.color_pair(2) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        try:
+            display_path = self.file_operation_dest_dir
+            if len(display_path) > self.width - 4:
+                display_path = "..." + display_path[-(self.width - 7):]
+            self.window.addstr(1, 2, display_path[: self.width - 4], curses.A_BOLD)
+        except curses.error:
+            pass
+
+        max_rows = max(1, self.height - 5)
+        for offset in range(max_rows):
+            row_idx = offset + 2
+            entry_index = offset
+            if entry_index >= len(self.file_operation_entries):
+                break
+            name, kind = self.file_operation_entries[entry_index]
+            display_name = name
+            if len(display_name) > self.width - 8:
+                display_name = display_name[: self.width - 9] + "..."
+            prefix = ">" if entry_index == self.file_operation_selected_index else " "
+            label = f"{prefix} {display_name}"
+            if kind == "dir":
+                label += "/"
+            style = curses.A_REVERSE if entry_index == self.file_operation_selected_index else curses.A_NORMAL
+            try:
+                self.window.addstr(row_idx, 2, label[: self.width - 4], style)
+            except curses.error:
+                pass
+
+        input_row = self.height - 2
+        try:
+            if self.file_operation_input_focused:
+                self.window.addstr(input_row, 2, "Path: ", curses.A_BOLD)
+            else:
+                self.window.addstr(input_row, 2, "Path: ", curses.color_pair(3))
+            field_width = max(1, self.width - 10)
+            field_start = max(0, self.file_operation_input_cursor - field_width + 1)
+            visible_input = self.file_operation_input[field_start : field_start + field_width]
+            if self.file_operation_input_focused:
+                self.window.addstr(input_row, 8, visible_input, curses.A_BOLD)
+            else:
+                self.window.addstr(input_row, 8, visible_input)
+            cursor_offset = min(self.file_operation_input_cursor - field_start, field_width - 1)
+            cursor_character = visible_input[cursor_offset : cursor_offset + 1] or " "
+            self.window.addstr(input_row, 8 + cursor_offset, cursor_character, curses.A_REVERSE)
+        except curses.error:
+            pass
+
+        if self.file_operation_error:
+            try:
+                self.window.addstr(self.height - 1, 2, self.file_operation_error[: max(0, self.width - 4)], curses.A_BOLD)
+            except curses.error:
+                pass
+
+        self.window.refresh()
+
+    def handle_file_operation_key(self, key: int | str) -> None:
+        if key == 27:
+            self.finish_file_operation()
+            return
+
+        # Tab переключает фокус между навигацией и вводом
+        if key == 9:
+            self.file_operation_input_focused = not self.file_operation_input_focused
+            return
+
+        # Если фокус на вводе — обрабатываем ввод пути
+        if self.file_operation_input_focused:
+            if isinstance(key, str):
+                if key.isprintable():
+                    self.file_operation_input = (
+                        self.file_operation_input[: self.file_operation_input_cursor]
+                        + key
+                        + self.file_operation_input[self.file_operation_input_cursor :]
+                    )
+                    self.file_operation_input_cursor += 1
+                    self.file_operation_error = ""
+                return
+
+            if key in (10, 13, curses.KEY_ENTER):
+                dest_input = os.path.expanduser(self.file_operation_input.strip())
+                if not dest_input:
+                    self.file_operation_error = "Destination path cannot be empty"
+                    return
+                if not os.path.isabs(dest_input):
+                    dest_input = os.path.join(self.file_operation_dest_dir, dest_input)
+                self.execute_file_operation(os.path.abspath(dest_input))
+                return
+
+            if key in (8, 127, curses.KEY_BACKSPACE):
+                if self.file_operation_input_cursor > 0:
+                    self.file_operation_input = (
+                        self.file_operation_input[: self.file_operation_input_cursor - 1]
+                        + self.file_operation_input[self.file_operation_input_cursor :]
+                    )
+                    self.file_operation_input_cursor -= 1
+                self.file_operation_error = ""
+                return
+
+            if key == curses.KEY_DC:
+                if self.file_operation_input_cursor < len(self.file_operation_input):
+                    self.file_operation_input = (
+                        self.file_operation_input[: self.file_operation_input_cursor]
+                        + self.file_operation_input[self.file_operation_input_cursor + 1 :]
+                    )
+                self.file_operation_error = ""
+                return
+
+            if key in (curses.KEY_LEFT, 260):
+                self.file_operation_input_cursor = max(0, self.file_operation_input_cursor - 1)
+                return
+
+            if key in (curses.KEY_RIGHT, 261):
+                self.file_operation_input_cursor = min(len(self.file_operation_input), self.file_operation_input_cursor + 1)
+                return
+
+            if key in (curses.KEY_HOME,):
+                self.file_operation_input_cursor = 0
+                return
+
+            if key in (curses.KEY_END,):
+                self.file_operation_input_cursor = len(self.file_operation_input)
+                return
+
+            return
+
+        # Если фокус на навигации — обрабатываем навигацию
+        if isinstance(key, str):
+            return
+
+        if key in (curses.KEY_UP, 259):
+            self.file_operation_selected_index = max(0, self.file_operation_selected_index - 1)
+            return
+
+        if key in (curses.KEY_DOWN, 258):
+            self.file_operation_selected_index = min(len(self.file_operation_entries) - 1, self.file_operation_selected_index + 1)
+            return
+
+        if key == curses.KEY_PPAGE:
+            self.file_operation_selected_index = 0
+            return
+
+        if key == curses.KEY_NPAGE:
+            self.file_operation_selected_index = max(0, len(self.file_operation_entries) - 1)
+            return
+
+        if key in (10, 13, curses.KEY_ENTER):
+            if not self.file_operation_entries:
+                return
+            name, kind = self.file_operation_entries[self.file_operation_selected_index]
+            if kind == "dir":
+                if name == "..":
+                    parent = os.path.dirname(self.file_operation_dest_dir)
+                    if parent and self.file_operation_dest_dir != parent:
+                        self.file_operation_dest_dir = parent
+                else:
+                    self.file_operation_dest_dir = os.path.join(self.file_operation_dest_dir, name)
+                self.file_operation_selected_index = 0
+                self.refresh_file_operation_entries()
+            return
+
+        if key == curses.KEY_PPAGE:
+            self.file_operation_selected_index = 0
+            return
+
+        if key == curses.KEY_NPAGE:
+            self.file_operation_selected_index = max(0, len(self.file_operation_entries) - 1)
+            return
+
+        if key in (curses.KEY_UP, 259):
+            self.file_operation_selected_index = max(0, self.file_operation_selected_index - 1)
+            return
+
+        if key in (curses.KEY_DOWN, 258):
+            self.file_operation_selected_index = min(len(self.file_operation_entries) - 1, self.file_operation_selected_index + 1)
+            return
 
     def restore_editor_state(self, state: tuple[list[str], int, int, tuple[int, int] | None]) -> None:
         lines, self.cursor_row, self.cursor_column, self.selection_anchor = state
@@ -925,6 +1222,9 @@ class TerminalWindow(Window):
             self.horizontal_offset = self.cursor_column - visible_columns + 1
 
     def render(self, active: bool = False) -> None:
+        if self.file_operation_active:
+            self.render_file_operation()
+            return
         self.keep_cursor_visible()
         self.window.erase()
         border_color = curses.color_pair(4 if active else 3)
@@ -1599,7 +1899,7 @@ class WindowManager:
             "Files",
             [
                 ("Превью при пролистывании", "preview_toggle"),
-                ("Режим копир./перемещ.: модал. окно", "copy_move_mode_toggle"),
+                ("Режим копир./перемещ.: два окна", "copy_move_mode_toggle"),
             ],
         ),
         2: (
@@ -1624,7 +1924,7 @@ class WindowManager:
         self.context_menu_selection = 0
         self.context_menu_window: curses.window | None = None
         self.context_menu_panel: curses.panel.panel | None = None
-        self.copy_move_mode = self.COPY_MOVE_MODAL
+        self.copy_move_mode = self.COPY_MOVE_TWO_WINDOWS
 
     def add_window(self, window: Window) -> None:
         if window.title in self.windows:
@@ -2123,18 +2423,41 @@ class WindowManager:
                     return True
 
         if key == 27:   # Escape key
+            if isinstance(active_window, TerminalWindow) and active_window.file_operation_active:
+                active_window.handle_file_operation_key(key)
+                self.render_windows()
+                return True
             return False
 
         if key == 9:    # Tab key
+            if isinstance(active_window, TerminalWindow) and active_window.file_operation_active:
+                active_window.handle_file_operation_key(key)
+                self.render_windows()
+                return True
             self.switch_active_window()
             return True
 
         if key == curses.KEY_BTAB:
+            if isinstance(active_window, TerminalWindow) and active_window.file_operation_active:
+                active_window.handle_file_operation_key(key)
+                self.render_windows()
+                return True
             self.switch_active_window(reverse=True)
             return True
 
         if key == curses.KEY_F2 and isinstance(active_window, FileManagerWindow):
-            if active_window.open_rename_file_modal():
+            if self.copy_move_mode == self.COPY_MOVE_TWO_WINDOWS:
+                if active_window.entries and 0 <= active_window.selected_index < len(active_window.entries):
+                    name, kind = active_window.entries[active_window.selected_index]
+                    if kind in {"file", "dir"} and name != "..":
+                        source_path = os.path.join(active_window.current_path, name)
+                        terminal_window = active_window.terminal_window
+                        if terminal_window is not None:
+                            terminal_window.start_file_operation("rename", source_path)
+                            self.active_window_name = terminal_window.title
+                            self.render_windows()
+                            return True
+            elif active_window.open_rename_file_modal():
                 self.last_active_window_name = self.active_window_name
                 self.modal_window_name = active_window.title
                 self.active_window_name = None
@@ -2142,7 +2465,18 @@ class WindowManager:
                 return True
 
         if key == curses.KEY_F3 and isinstance(active_window, FileManagerWindow):
-            if active_window.open_copy_file_modal():
+            if self.copy_move_mode == self.COPY_MOVE_TWO_WINDOWS:
+                if active_window.entries and 0 <= active_window.selected_index < len(active_window.entries):
+                    name, kind = active_window.entries[active_window.selected_index]
+                    if kind in {"file", "dir"} and name != "..":
+                        source_path = os.path.join(active_window.current_path, name)
+                        terminal_window = active_window.terminal_window
+                        if terminal_window is not None:
+                            terminal_window.start_file_operation("copy", source_path)
+                            self.active_window_name = terminal_window.title
+                            self.render_windows()
+                            return True
+            elif active_window.open_copy_file_modal():
                 self.last_active_window_name = self.active_window_name
                 self.modal_window_name = active_window.title
                 self.active_window_name = None
@@ -2175,6 +2509,19 @@ class WindowManager:
                 return True
 
         if isinstance(active_window, TerminalWindow):
+            if active_window.file_operation_active:
+                was_active = active_window.file_operation_active
+                active_window.handle_file_operation_key(key)
+                if was_active and not active_window.file_operation_active:
+                    file_manager = next(
+                        (window for window in self.windows.values() if isinstance(window, FileManagerWindow)),
+                        None,
+                    )
+                    if file_manager is not None:
+                        file_manager.refresh_content()
+                    self.active_window_name = "Files"
+                self.render_windows()
+                return True
             active_window.handle_key(key)
             self.render_windows()
             return True
