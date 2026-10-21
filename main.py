@@ -212,6 +212,18 @@ class Window:
         self.width = width
         self.refresh_window()
 
+    def set_geometry(self, x1: int, y1: int, x2: int, y2: int) -> None:
+        if x2 <= x1 or y2 <= y1:
+            return
+        self.x1 = x1
+        self.y1 = y1
+        self.x2 = x2
+        self.y2 = y2
+        self.height = y2 - y1
+        self.width = x2 - x1
+        self.window = curses.newwin(self.height, self.width, self.y1, self.x1)
+        self.window.keypad(True)
+
     def print_title(self, color: int) -> None:
         title_size = (self.width - len(self.title)) // 2
         title_x = max(1, title_size)
@@ -1894,6 +1906,7 @@ class FileManagerWindow(Window):
 
 class WindowManager:
     NON_SWITCHABLE_WINDOWS = {"Clock", "Date", "System info", "Hardware info", "Network info"}
+    INFO_WINDOWS = {"Clock", "Date", "System info", "Hardware info", "Network info"}
 
     COPY_MOVE_MODAL = "модал. окно"
     COPY_MOVE_TWO_WINDOWS = "два окна"
@@ -1914,6 +1927,7 @@ class WindowManager:
             [
                 ("Режим отображения экранов: комбинированный", "layout_mode_toggle"),
                 ("Отображать секунды у часов", "clock_seconds_toggle"),
+                ("Скрыть инфо панели", "hide_info_panels_toggle"),
             ],
         ),
     }
@@ -1932,6 +1946,7 @@ class WindowManager:
         self.copy_move_mode = self.COPY_MOVE_TWO_WINDOWS
         self.layout_mode = self.LAYOUT_COMBINED
         self.clock_seconds_enabled = False
+        self.hide_info_panels = False
 
     def add_window(self, window: Window) -> None:
         if window.title in self.windows:
@@ -1979,8 +1994,61 @@ class WindowManager:
         self.active_window_name = names[(active_index + step) % len(names)]
         self.render_windows()
 
+    def is_window_visible(self, name: str) -> bool:
+        if self.hide_info_panels and name in self.INFO_WINDOWS:
+            return False
+        return True
+
+    def apply_layout(self) -> None:
+        columns, lines = curses.COLS, curses.LINES
+        bottom = lines - 3
+        files = self.windows.get("Files")
+        terminal = self.windows.get("Terminal")
+
+        if self.hide_info_panels:
+            half = columns // 2
+            if half < 1 or bottom < 3:
+                return
+            if files is not None:
+                files.set_geometry(0, 2, half, bottom)
+            if terminal is not None:
+                terminal.set_geometry(half, 2, columns, bottom)
+        else:
+            quarter = int(columns * 0.25)
+            three_quarters = int(columns * 0.75)
+            if quarter < 1 or three_quarters <= quarter or bottom < 3:
+                return
+            if files is not None:
+                files.set_geometry(0, 2, quarter, bottom)
+            if terminal is not None:
+                terminal.set_geometry(quarter, 2, three_quarters, bottom)
+
+            clock = self.windows.get("Clock")
+            if clock is not None:
+                clock.set_geometry(three_quarters, 2, int(columns * 0.875), 7)
+            date = self.windows.get("Date")
+            if date is not None:
+                date.set_geometry(int(columns * 0.875), 2, columns, 7)
+
+            system_info_geometry, hardware_info_geometry, network_info_geometry = right_panel_geometry(columns, lines)
+            for name, geometry in (
+                ("System info", system_info_geometry),
+                ("Hardware info", hardware_info_geometry),
+                ("Network info", network_info_geometry),
+            ):
+                window = self.windows.get(name)
+                if window is not None:
+                    window.set_geometry(*geometry)
+
+        if self.active_window_name is not None and not self.is_window_visible(self.active_window_name):
+            self.active_window_name = "Files" if "Files" in self.windows else None
+
+        self.redraw_screen()
+
     def render_windows(self) -> None:
         for name, window in self.windows.items():
+            if not self.is_window_visible(name):
+                continue
             is_active = name == self.active_window_name
             if isinstance(window, DateTimeWindow):
                 window.render_time(is_active)
@@ -2005,6 +2073,8 @@ class WindowManager:
             return f"Режим отображения экранов: {self.layout_mode}"
         if action == "clock_seconds_toggle":
             return f"* {label}" if self.clock_seconds_enabled else label
+        if action == "hide_info_panels_toggle":
+            return f"* {label}" if self.hide_info_panels else label
         return label
 
     def open_context_menu(self, menu_number: int) -> None:
@@ -2188,6 +2258,11 @@ class WindowManager:
             self.clock_seconds_enabled = not self.clock_seconds_enabled
             return
 
+        if action == "hide_info_panels_toggle":
+            self.hide_info_panels = not self.hide_info_panels
+            self.apply_layout()
+            return
+
         file_manager = next(
             (window for window in self.windows.values() if isinstance(window, FileManagerWindow)),
             None,
@@ -2248,6 +2323,8 @@ class WindowManager:
 
     def activate_window_at(self, mouse_x: int, mouse_y: int) -> bool:
         for name, window in self.windows.items():
+            if not self.is_window_visible(name):
+                continue
             if window.x1 <= mouse_x < window.x2 and window.y1 <= mouse_y < window.y2:
                 self.active_window_name = name
                 return True
