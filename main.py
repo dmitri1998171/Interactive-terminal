@@ -1893,6 +1893,9 @@ class WindowManager:
 
     COPY_MOVE_MODAL = "модал. окно"
     COPY_MOVE_TWO_WINDOWS = "два окна"
+    LAYOUT_TERMINAL_CENTER = "терминал по центру"
+    LAYOUT_FILES_CENTER = "файловый менеджер по центру"
+    LAYOUT_COMBINED = "комбинированный"
 
     MENU_DEFINITIONS = {
         1: (
@@ -1905,10 +1908,8 @@ class WindowManager:
         2: (
             "Settings",
             [
-                ("Create file", "create"),
-                ("Move / rename", "rename"),
-                ("Copy", "copy"),
-                ("Delete", "delete"),
+                ("Режим отображения экранов: комбинированный", "layout_mode_toggle"),
+                ("Отображать секунды у часов", "clock_seconds_toggle"),
             ],
         ),
     }
@@ -1925,6 +1926,8 @@ class WindowManager:
         self.context_menu_window: curses.window | None = None
         self.context_menu_panel: curses.panel.panel | None = None
         self.copy_move_mode = self.COPY_MOVE_TWO_WINDOWS
+        self.layout_mode = self.LAYOUT_COMBINED
+        self.clock_seconds_enabled = False
 
     def add_window(self, window: Window) -> None:
         if window.title in self.windows:
@@ -1994,6 +1997,10 @@ class WindowManager:
     def resolve_menu_label(self, label: str, action: str) -> str:
         if action == "copy_move_mode_toggle":
             return f"Режим копир./перемещ.: {self.copy_move_mode}"
+        if action == "layout_mode_toggle":
+            return f"Режим отображения экранов: {self.layout_mode}"
+        if action == "clock_seconds_toggle":
+            return f"* {label}" if self.clock_seconds_enabled else label
         return label
 
     def open_context_menu(self, menu_number: int) -> None:
@@ -2157,6 +2164,26 @@ class WindowManager:
             self.set_active_window(action.partition(":")[2])
             return
 
+        if action == "copy_move_mode_toggle":
+            if self.copy_move_mode == self.COPY_MOVE_MODAL:
+                self.copy_move_mode = self.COPY_MOVE_TWO_WINDOWS
+            else:
+                self.copy_move_mode = self.COPY_MOVE_MODAL
+            return
+
+        if action == "layout_mode_toggle":
+            if self.layout_mode == self.LAYOUT_TERMINAL_CENTER:
+                self.layout_mode = self.LAYOUT_FILES_CENTER
+            elif self.layout_mode == self.LAYOUT_FILES_CENTER:
+                self.layout_mode = self.LAYOUT_COMBINED
+            else:
+                self.layout_mode = self.LAYOUT_TERMINAL_CENTER
+            return
+
+        if action == "clock_seconds_toggle":
+            self.clock_seconds_enabled = not self.clock_seconds_enabled
+            return
+
         file_manager = next(
             (window for window in self.windows.values() if isinstance(window, FileManagerWindow)),
             None,
@@ -2176,12 +2203,6 @@ class WindowManager:
         elif action == "preview_toggle":
             file_manager.preview_enabled = not file_manager.preview_enabled
             self.active_window_name = file_manager.title
-            opened = False
-        elif action == "copy_move_mode_toggle":
-            if self.copy_move_mode == self.COPY_MOVE_MODAL:
-                self.copy_move_mode = self.COPY_MOVE_TWO_WINDOWS
-            else:
-                self.copy_move_mode = self.COPY_MOVE_MODAL
             opened = False
         else:
             opened = False
