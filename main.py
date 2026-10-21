@@ -1,9 +1,14 @@
 import curses
 import curses.panel
+import fcntl
 import ipaddress
 import os
+import pty
 import re
+import select
 import shutil
+import signal
+import struct
 import subprocess
 import sys
 import termios
@@ -14,6 +19,11 @@ import urllib.request
 from collections import deque
 from datetime import datetime
 from typing import TextIO
+
+try:
+    import pyte
+except ImportError:  # pragma: no cover - optional dependency
+    pyte = None
 
 ARR_SIZE = 1024
 DEBUG = True
@@ -32,7 +42,55 @@ SHIFT_ARROW_UP = -5
 SHIFT_ARROW_DOWN = -6
 SHIFT_ARROW_LEFT = -7
 SHIFT_ARROW_RIGHT = -8
+ALT_TAB_KEY = -12
 TOP_BAR_TEXT = "Files    Settings"
+
+SHELL_COLOR_MAP = {
+    "black": 0,
+    "red": 1,
+    "green": 2,
+    "brown": 3,
+    "yellow": 3,
+    "blue": 4,
+    "magenta": 5,
+    "cyan": 6,
+    "white": 7,
+    "brightblack": 0,
+    "brightred": 1,
+    "brightgreen": 2,
+    "brightbrown": 3,
+    "brightyellow": 3,
+    "brightblue": 4,
+    "brightmagenta": 5,
+    "brightcyan": 6,
+    "brightwhite": 7,
+}
+
+SHELL_KEY_SEQUENCES = {
+    curses.KEY_UP: b"\x1b[A",
+    curses.KEY_DOWN: b"\x1b[B",
+    curses.KEY_RIGHT: b"\x1b[C",
+    curses.KEY_LEFT: b"\x1b[D",
+    curses.KEY_HOME: b"\x1b[H",
+    curses.KEY_END: b"\x1b[F",
+    curses.KEY_PPAGE: b"\x1b[5~",
+    curses.KEY_NPAGE: b"\x1b[6~",
+    curses.KEY_IC: b"\x1b[2~",
+    curses.KEY_DC: b"\x1b[3~",
+    curses.KEY_BTAB: b"\x1b[Z",
+    curses.KEY_F1: b"\x1bOP",
+    curses.KEY_F2: b"\x1bOQ",
+    curses.KEY_F3: b"\x1bOR",
+    curses.KEY_F4: b"\x1bOS",
+    curses.KEY_F5: b"\x1b[15~",
+    curses.KEY_F6: b"\x1b[17~",
+    curses.KEY_F7: b"\x1b[18~",
+    curses.KEY_F8: b"\x1b[19~",
+    curses.KEY_F9: b"\x1b[20~",
+    curses.KEY_F10: b"\x1b[21~",
+    curses.KEY_F11: b"\x1b[23~",
+    curses.KEY_F12: b"\x1b[24~",
+}
 
 
 def log_info(value: object) -> None:
@@ -70,37 +128,46 @@ def top_tab_menu_at(x: int, y: int) -> int | None:
 
 def bottom_bar_labels(width: int) -> list[tuple[int, str, str]]:
     labels = [
-        (1, "Tab", "next"),
-        (11, "Shift+Tab", "prev"),
-        (26, "Esc", "quit"),
+        (1, "F1", "new"),
+        (10, "F2", "rename"),
+        (23, "F3", "copy"),
+        (34, "F4", "paste"),
+        (46, "F5", "undo"),
+        (58, "F6", "redo"),
+        (70, "F7", "layout"),
+        (84, "F8", "delete"),
+        (96, "F9", "next"),
+        (107, "F10", "quit"),
     ]
 
     if width > 100:
         labels = [
-            (1, "Tab", "след. окно"),
-            (17, "Shift+Tab", "пред. окно"),
-            (39, "Esc", "Выход"),
-            (50, "F1", "Создать"),
-            (62, "F2", "Переим."),
-            (74, "F3", "Копия"),
-            (84, "F8", "Удалить"),
-            (96, "F5", "Undo"),
-            (105, "F6", "Redo"),
+            (1, "F1", "Создать"),
+            (13, "F2", "Переим."),
+            (27, "F3", "Копия"),
+            (39, "F4", "Вставка"),
+            (53, "F5", "Undo"),
+            (65, "F6", "Redo"),
+            (77, "F7", "Раскладка"),
+            (93, "F8", "Удалить"),
+            (106, "F9", "След. окно"),
+            (122, "F10", "Выход"),
         ]
 
-    return labels
+    return [label for label in labels if label[0] < width]
 
 
 BOTTOM_BAR_KEY_CODES = {
-    "Tab": 9,
-    "Shift+Tab": curses.KEY_BTAB,
-    "Esc": 27,
     "F1": curses.KEY_F1,
     "F2": curses.KEY_F2,
     "F3": curses.KEY_F3,
+    "F4": curses.KEY_F4,
     "F5": curses.KEY_F5,
     "F6": curses.KEY_F6,
+    "F7": curses.KEY_F7,
     "F8": curses.KEY_F8,
+    "F9": curses.KEY_F9,
+    "F10": curses.KEY_F10,
 }
 
 
@@ -727,6 +794,136 @@ class NetworkInfoWindow(Window):
         self.window.refresh()
 
 
+class ShellSession:
+    """Interactive shell attached to a pseudo-terminal, rendered through pyte."""
+
+    def __init__(self, rows: int, cols: int) -> None:
+        self.rows = max(1, rows)
+        self.cols = max(1, cols)
+        self.lock = threading.Lock()
+        self.alive = False
+        self.master_fd = -1
+        self.process: subprocess.Popen[bytes] | None = None
+        self.screen = pyte.Screen(self.cols, self.rows) if pyte is not None else None
+        self.stream = pyte.ByteStream(self.screen) if self.screen is not None else None
+        self.error = "" if pyte is not None else "pyte is not installed: pip install pyte"
+
+        if pyte is None:
+            return
+
+        shell = os.environ.get("SHELL") or "/bin/bash"
+        environment = os.environ.copy()
+        environment["TERM"] = "xterm-256color"
+        environment.setdefault("COLORTERM", "truecolor")
+
+        def child_setup() -> None:
+            os.setsid()
+            try:
+                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            except OSError:
+                pass
+
+        try:
+            self.master_fd, slave_fd = pty.openpty()
+            self._set_winsize(slave_fd, self.rows, self.cols)
+            self.process = subprocess.Popen(
+                [shell, "-i"],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=environment,
+                preexec_fn=child_setup,
+                close_fds=True,
+            )
+            os.close(slave_fd)
+        except OSError as error:
+            self.error = f"Unable to start shell: {error}"
+            if self.master_fd >= 0:
+                try:
+                    os.close(self.master_fd)
+                except OSError:
+                    pass
+                self.master_fd = -1
+            return
+
+        self.alive = True
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    @staticmethod
+    def _set_winsize(fd: int, rows: int, cols: int) -> None:
+        try:
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        except OSError:
+            pass
+
+    def _reader(self) -> None:
+        while self.alive:
+            try:
+                readable, _, _ = select.select([self.master_fd], [], [], 0.1)
+            except (OSError, ValueError):
+                break
+            if not readable:
+                if self.process is not None and self.process.poll() is not None:
+                    break
+                continue
+            try:
+                data = os.read(self.master_fd, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            if self.stream is not None:
+                with self.lock:
+                    try:
+                        self.stream.feed(data)
+                    except Exception:
+                        pass
+        self.alive = False
+
+    def write(self, data: bytes) -> None:
+        if self.master_fd < 0:
+            return
+        try:
+            os.write(self.master_fd, data)
+        except OSError:
+            pass
+
+    def resize(self, rows: int, cols: int) -> None:
+        rows = max(1, rows)
+        cols = max(1, cols)
+        if rows == self.rows and cols == self.cols:
+            return
+        self.rows, self.cols = rows, cols
+        if self.screen is not None:
+            with self.lock:
+                try:
+                    self.screen.resize(rows, cols)
+                except Exception:
+                    pass
+        if self.master_fd >= 0:
+            self._set_winsize(self.master_fd, rows, cols)
+            if self.process is not None and self.process.poll() is None:
+                try:
+                    os.kill(self.process.pid, signal.SIGWINCH)
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        self.alive = False
+        if self.process is not None and self.process.poll() is None:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGHUP)
+            except OSError:
+                pass
+        if self.master_fd >= 0:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+            self.master_fd = -1
+
+
 class TerminalWindow(Window):
     STATUS_BUTTONS: tuple[tuple[str, int], ...] = (
         ("F2 save", curses.KEY_F2),
@@ -778,9 +975,13 @@ class TerminalWindow(Window):
         self.file_operation_input_cursor = 0
         self.file_operation_error = ""
         self.file_operation_input_focused = False
+        self.mode = "shell"
+        self.previous_mode = "shell"
+        self.shell = ShellSession(max(1, self.height - 2), max(1, self.width - 2))
         self.render()
 
     def set_content(self, text: str, file_path: str | None = None) -> None:
+        self.mode = "editor"
         self.content_lines = text.split("\n") or [""]
         self.scroll_offset = 0
         self.cursor_row = 0
@@ -821,6 +1022,8 @@ class TerminalWindow(Window):
         self.redo_history.clear()
 
     def start_file_operation(self, operation_type: str, source_path: str) -> None:
+        self.previous_mode = self.mode
+        self.mode = "file_operation"
         self.file_operation_active = True
         self.file_operation_type = operation_type
         self.file_operation_source = source_path
@@ -867,6 +1070,8 @@ class TerminalWindow(Window):
         self.file_operation_input = ""
         self.file_operation_input_cursor = 0
         self.file_operation_error = ""
+        self.mode = self.previous_mode if self.previous_mode else "shell"
+        self.previous_mode = self.mode
 
     def execute_file_operation(self, destination_path: str) -> None:
         source_path = os.path.abspath(self.file_operation_source)
@@ -1241,6 +1446,87 @@ class TerminalWindow(Window):
         if self.file_operation_active:
             self.render_file_operation()
             return
+        if self.mode == "editor":
+            self.render_editor(active)
+            return
+        self.render_shell(active)
+
+    def render_shell(self, active: bool = False) -> None:
+        self.window.erase()
+        border_color = curses.color_pair(4 if active else 3)
+        self.window.attron(border_color)
+        self.window.box()
+        self.window.attroff(border_color)
+        self.print_title(curses.color_pair(2 if active else 3))
+
+        screen = self.shell.screen if self.shell is not None else None
+        if screen is None:
+            message = self.shell.error if self.shell is not None else "Shell is not available"
+            try:
+                self.window.addstr(1, 2, message[: max(0, self.width - 4)])
+            except curses.error:
+                pass
+            self.window.refresh()
+            return
+
+        rows = min(screen.lines, max(0, self.height - 2))
+        columns = max(0, self.width - 2)
+        default_char = pyte.screens.Char(" ", "default", "default")
+        with self.shell.lock:
+            for row in range(rows):
+                line = screen.buffer[row]
+                column = 0
+                while column < columns:
+                    cell = line.get(column) or default_char
+                    run = cell.data
+                    next_column = column + 1
+                    while next_column < columns:
+                        next_cell = line.get(next_column) or default_char
+                        if (
+                            next_cell.fg != cell.fg
+                            or next_cell.bg != cell.bg
+                            or next_cell.bold != cell.bold
+                            or next_cell.underscore != cell.underscore
+                            or next_cell.reverse != cell.reverse
+                        ):
+                            break
+                        run += next_cell.data
+                        next_column += 1
+                    style = self.shell_cell_style(cell)
+                    try:
+                        self.window.addstr(1 + row, 1 + column, run[: columns - column], style)
+                    except curses.error:
+                        pass
+                    column = next_column
+
+            if active:
+                cursor_y = screen.cursor.y
+                cursor_x = screen.cursor.x
+                if 0 <= cursor_y < rows and 0 <= cursor_x < columns:
+                    cursor_cell = screen.buffer[cursor_y].get(cursor_x) or default_char
+                    cursor_char = cursor_cell.data or " "
+                    try:
+                        self.window.addstr(1 + cursor_y, 1 + cursor_x, cursor_char, curses.A_REVERSE)
+                    except curses.error:
+                        pass
+
+        self.window.refresh()
+
+    @staticmethod
+    def shell_cell_style(cell: object) -> int:
+        foreground = getattr(cell, "fg", "default")
+        background = getattr(cell, "bg", "default")
+        reverse = getattr(cell, "reverse", False)
+        if reverse:
+            foreground, background = background, foreground
+        style = curses.color_pair(color_num(SHELL_COLOR_MAP.get(foreground, 7), SHELL_COLOR_MAP.get(background, 0)))
+        if getattr(cell, "bold", False):
+            style |= curses.A_BOLD
+        if getattr(cell, "underscore", False):
+            style |= curses.A_UNDERLINE
+        return style
+
+    def render_editor(self, active: bool = False) -> None:
         self.keep_cursor_visible()
         self.window.erase()
         border_color = curses.color_pair(4 if active else 3)
@@ -1301,7 +1587,55 @@ class TerminalWindow(Window):
 
         self.window.refresh()
 
+    def set_geometry(self, x1: int, y1: int, x2: int, y2: int) -> None:
+        super().set_geometry(x1, y1, x2, y2)
+        shell = getattr(self, "shell", None)
+        if shell is not None:
+            shell.resize(max(1, self.height - 2), max(1, self.width - 2))
+
+    def handle_shell_key(self, key: int | str) -> None:
+        if self.shell is None:
+            return
+
+        if isinstance(key, str):
+            if key == "\x1b":
+                self.shell.write(b"\x1b")
+            elif key == "	":
+                self.shell.write(b"	")
+            elif key in ("\n", "\r"):
+                self.shell.write(b"\r")
+            elif key.isprintable():
+                self.shell.write(key.encode("utf-8"))
+            return
+
+        if key == curses.ERR:
+            return
+        if key == 27:
+            self.shell.write(b"\x1b")
+            return
+        if key == 9:
+            self.shell.write(b"	")
+            return
+        if key in (10, 13, curses.KEY_ENTER):
+            self.shell.write(b"\r")
+            return
+        if key in (8, 127, curses.KEY_BACKSPACE):
+            self.shell.write(b"\x7f")
+            return
+
+        sequence = SHELL_KEY_SEQUENCES.get(key)
+        if sequence is not None:
+            self.shell.write(sequence)
+            return
+
+        if 1 <= key <= 26:
+            self.shell.write(bytes([key]))
+
     def handle_key(self, key: int | str) -> None:
+        if key == 27:
+            self.mode = "shell"
+            self.render()
+            return
         if isinstance(key, str):
             if key in ("\b", "\x7f"):
                 key = curses.KEY_BACKSPACE
@@ -2386,6 +2720,8 @@ class WindowManager:
             window.timeout(INPUT_POLL_INTERVAL_MS)
 
         encoded = "".join(sequence)
+        if encoded in ("	", "[9;3u", "[27;3;9~"):
+            return ALT_TAB_KEY
         if encoded in ("[115;9u", "[83;10u"):
             return COMMAND_S_KEY
         if encoded in ("[122;9u", "[90;9u"):
@@ -2488,7 +2824,12 @@ class WindowManager:
 
         active_window = self.get_active_window()
         input_window = active_window.get_window()
-        input_window.timeout(INPUT_POLL_INTERVAL_MS)
+        shell_active = (
+            isinstance(active_window, TerminalWindow)
+            and active_window.mode == "shell"
+            and not active_window.file_operation_active
+        )
+        input_window.timeout(50 if shell_active else INPUT_POLL_INTERVAL_MS)
         key = self.read_terminal_key(input_window)
         if key == "\x1b":
             key = 27
@@ -2497,6 +2838,7 @@ class WindowManager:
         elif isinstance(key, str) and len(key) == 1 and not key.isprintable():
             key = ord(key)
 
+        key_from_mouse = False
         if key == curses.KEY_MOUSE:
             try:
                 _, mouse_x, mouse_y, _, button_state = curses.getmouse()
@@ -2508,11 +2850,13 @@ class WindowManager:
                 bottom_key = bottom_bar_at(mouse_x, mouse_y)
                 if bottom_key is not None:
                     key = bottom_key
+                    key_from_mouse = True
                 elif (
                     isinstance(active_window, TerminalWindow)
                     and (editor_key := active_window.status_button_at(mouse_x, mouse_y)) is not None
                 ):
                     key = editor_key
+                    key_from_mouse = True
                 elif self.handle_files_mouse_click(mouse_x, mouse_y, button_state):
                     self.render_windows()
                     return True
@@ -2523,6 +2867,32 @@ class WindowManager:
                 elif self.activate_window_at(mouse_x, mouse_y):
                     self.render_windows()
                     return True
+
+        if key == ALT_TAB_KEY:
+            self.switch_active_window()
+            return True
+
+        if isinstance(active_window, TerminalWindow) and not active_window.file_operation_active:
+            if key == curses.KEY_F10:
+                return False
+            if key == curses.KEY_F9:
+                self.switch_active_window()
+                return True
+            if shell_active and not key_from_mouse:
+                active_window.handle_shell_key(key)
+                self.render_windows()
+                return True
+            if active_window.mode == "editor" and key == 27:
+                active_window.handle_key(key)
+                self.render_windows()
+                return True
+
+        if key == curses.KEY_F10:
+            return False
+
+        if key == curses.KEY_F9:
+            self.switch_active_window()
+            return True
 
         if key == 27:   # Escape key
             if isinstance(active_window, TerminalWindow) and active_window.file_operation_active:
@@ -2537,14 +2907,6 @@ class WindowManager:
                 self.render_windows()
                 return True
             self.switch_active_window()
-            return True
-
-        if key == curses.KEY_BTAB:
-            if isinstance(active_window, TerminalWindow) and active_window.file_operation_active:
-                active_window.handle_file_operation_key(key)
-                self.render_windows()
-                return True
-            self.switch_active_window(reverse=True)
             return True
 
         if key == curses.KEY_F2 and isinstance(active_window, FileManagerWindow):
@@ -2624,7 +2986,8 @@ class WindowManager:
                     self.active_window_name = "Files"
                 self.render_windows()
                 return True
-            active_window.handle_key(key)
+            if active_window.mode == "editor":
+                active_window.handle_key(key)
             self.render_windows()
             return True
 
@@ -2690,8 +3053,11 @@ def run(stdscr: curses.window) -> None:
     window_manager.active_window_name = "Files"
     window_manager.render_windows()
 
-    while window_manager.handle_input():
-        window_manager.render_windows()
+    try:
+        while window_manager.handle_input():
+            window_manager.render_windows()
+    finally:
+        terminal_window.shell.close()
 
 
 def main() -> None:
