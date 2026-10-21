@@ -250,16 +250,20 @@ class Window:
 
 
 class DateTimeWindow(Window):
-    def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str, _isDate: bool = False) -> None:
+    def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str, _isDate: bool = False, window_manager: "WindowManager | None" = None) -> None:
         super().__init__(x1, y1, x2, y2, title)
         self.isDate = _isDate
+        self.window_manager = window_manager
         self.render_time()
 
     def render_time(self, active: bool = False) -> None:
         if self.isDate:
             pattern = "%d.%m.%Y"
         else:
-            pattern = "%H:%M:%S"
+            if self.window_manager is not None and self.window_manager.clock_seconds_enabled:
+                pattern = "%H:%M:%S"
+            else:
+                pattern = "%H:%M"
 
         current_time = datetime.now().strftime(pattern)
         self.window.erase()
@@ -2599,7 +2603,7 @@ def run(stdscr: curses.window) -> None:
     terminal_window = TerminalWindow(int(columns * 0.25), 2, int(columns * 0.75), lines - 3, "Terminal")
     window_manager.add_window(FileManagerWindow(0, 2, int(columns * 0.25), lines - 3, "Files", path, terminal_window))
     window_manager.add_window(terminal_window)
-    window_manager.add_window(DateTimeWindow(int(columns * 0.75), 2, int(columns * 0.875), 7, "Clock"))
+    window_manager.add_window(DateTimeWindow(int(columns * 0.75), 2, int(columns * 0.875), 7, "Clock", window_manager=window_manager))
     window_manager.add_window(DateTimeWindow(int(columns * 0.875), 2, columns, 7, "Date", True))
     system_info_geometry, hardware_info_geometry, network_info_geometry = right_panel_geometry(columns, lines)
     window_manager.add_window(SystemInfoWindow(*system_info_geometry, "System info"))
