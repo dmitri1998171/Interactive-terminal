@@ -32,6 +32,8 @@ INPUT_POLL_INTERVAL_MS = 250
 SYSTEM_BAR_GREEN_PAIR = 5
 SYSTEM_BAR_YELLOW_PAIR = 6
 SYSTEM_BAR_RED_PAIR = 7
+LIGHT_THEME_INACTIVE_BORDER_PAIR = 8
+LIGHT_THEME_ACTIVE_BORDER_PAIR = 9
 SHIFT_ENTER_KEY = -2
 COMMAND_S_KEY = -3
 COMMAND_V_KEY = -4
@@ -205,6 +207,42 @@ def init_colorpairs() -> None:
                 pass
 
 
+def draw_window_border(window: curses.window, light_theme: bool = False) -> None:
+    if not light_theme:
+        window.box()
+        return
+
+    height, width = window.getmaxyx()
+    if width < 2 or height < 2:
+        return
+
+    top = "┌" + "─" * (width - 2) + "┐"
+    bottom = "└" + "─" * (width - 2) + "┘"
+    try:
+        window.addstr(0, 0, top)
+    except curses.error:
+        pass
+
+    for row in range(1, height - 1):
+        try:
+            window.addstr(row, 0, "│")
+        except curses.error:
+            pass
+        try:
+            window.addstr(row, width - 1, "│")
+        except curses.error:
+            pass
+
+    for column, character in enumerate(bottom):
+        try:
+            window.addstr(height - 1, column, character)
+        except curses.error:
+            try:
+                window.insstr(height - 1, column, character)
+            except curses.error:
+                pass
+
+
 def init_terminal() -> None:
     try:
         curses.curs_set(0)
@@ -212,6 +250,10 @@ def init_terminal() -> None:
         pass
 
     curses.start_color()
+    try:
+        curses.use_default_colors()
+    except curses.error:
+        pass
     curses.noecho()
     curses.cbreak()
     try:
@@ -245,6 +287,18 @@ def init_terminal() -> None:
         except curses.error:
             pass
 
+    for pair, foreground in (
+        (LIGHT_THEME_INACTIVE_BORDER_PAIR, curses.COLOR_WHITE),
+        (LIGHT_THEME_ACTIVE_BORDER_PAIR, curses.COLOR_YELLOW),
+    ):
+        try:
+            curses.init_pair(pair, foreground, -1)
+        except curses.error:
+            try:
+                curses.init_pair(pair, foreground, curses.COLOR_BLACK)
+            except curses.error:
+                pass
+
 
 class Window:
     def __init__(self, x1: int, y1: int, x2: int, y2: int, title: str) -> None:
@@ -260,17 +314,25 @@ class Window:
         self.y2 = y2
         self.x2 = x2
         self.title = title
+        self.light_theme = False
 
         self.window = curses.newwin(self.height, self.width, self.y1, self.x1)
         self.window.keypad(True)
         self.refresh_window()
 
+    def draw_border(self, active: bool = False) -> None:
+        if self.light_theme:
+            border_pair = LIGHT_THEME_ACTIVE_BORDER_PAIR if active else LIGHT_THEME_INACTIVE_BORDER_PAIR
+        else:
+            border_pair = 4 if active else 3
+        border_color = curses.color_pair(border_pair)
+        self.window.attron(border_color)
+        draw_window_border(self.window, self.light_theme)
+        self.window.attroff(border_color)
+
     def refresh_window(self, active: bool = False) -> None:
         self.window.erase()
-        border_color = curses.color_pair(4 if active else 3)
-        self.window.attron(border_color)
-        self.window.box()
-        self.window.attroff(border_color)
+        self.draw_border(active)
         self.print_title(curses.color_pair(2 if active else 3))
         self.window.refresh()
 
@@ -346,10 +408,7 @@ class DateTimeWindow(Window):
 
         current_time = datetime.now().strftime(pattern)
         self.window.erase()
-        border_color = curses.color_pair(4 if active else 3)
-        self.window.attron(border_color)
-        self.window.box()
-        self.window.attroff(border_color)
+        self.draw_border(active)
         self.print_title(curses.color_pair(2 if active else 3))
 
         try:
@@ -1120,10 +1179,7 @@ class TerminalWindow(Window):
         if not self.file_operation_active:
             return
         self.window.erase()
-        border_color = curses.color_pair(4)
-        self.window.attron(border_color)
-        self.window.box()
-        self.window.attroff(border_color)
+        self.draw_border(True)
         title_text = "Copy file" if self.file_operation_type == "copy" else "Move / rename file"
         if self.file_operation_source_is_dir:
             title_text = "Copy folder" if self.file_operation_type == "copy" else "Move / rename folder"
@@ -1453,10 +1509,7 @@ class TerminalWindow(Window):
 
     def render_shell(self, active: bool = False) -> None:
         self.window.erase()
-        border_color = curses.color_pair(4 if active else 3)
-        self.window.attron(border_color)
-        self.window.box()
-        self.window.attroff(border_color)
+        self.draw_border(active)
         self.print_title(curses.color_pair(2 if active else 3))
 
         screen = self.shell.screen if self.shell is not None else None
@@ -1529,10 +1582,7 @@ class TerminalWindow(Window):
     def render_editor(self, active: bool = False) -> None:
         self.keep_cursor_visible()
         self.window.erase()
-        border_color = curses.color_pair(4 if active else 3)
-        self.window.attron(border_color)
-        self.window.box()
-        self.window.attroff(border_color)
+        self.draw_border(active)
         self.print_title(curses.color_pair(2 if active else 3))
 
         visible_rows = max(1, self.height - 3)
@@ -1845,11 +1895,14 @@ class FileManagerWindow(Window):
         modal_bg = curses.color_pair(3)
         modal_title = curses.color_pair(4)
         modal_text = curses.color_pair(0)
-        modal_border = curses.color_pair(4)
+        if self.light_theme:
+            modal_border = curses.color_pair(LIGHT_THEME_ACTIVE_BORDER_PAIR)
+        else:
+            modal_border = curses.color_pair(4)
 
         try:
             modal_window.attron(modal_border)
-            modal_window.box()
+            draw_window_border(modal_window, self.light_theme)
             modal_window.attroff(modal_border)
             modal_window.attron(modal_bg)
             for y in range(1, modal_height - 1):
@@ -1929,10 +1982,7 @@ class FileManagerWindow(Window):
 
     def render(self, active: bool = False) -> None:
         self.window.erase()
-        border_color = curses.color_pair(4 if active else 3)
-        self.window.attron(border_color)
-        self.window.box()
-        self.window.attroff(border_color)
+        self.draw_border(active)
         self.print_title(curses.color_pair(2 if active else 3))
 
         try:
@@ -2262,6 +2312,7 @@ class WindowManager:
                 ("Режим отображения экранов: комбинированный", "layout_mode_toggle"),
                 ("Отображать секунды у часов", "clock_seconds_toggle"),
                 ("Скрыть инфо панели", "hide_info_panels_toggle"),
+                ("Легкая тема", "light_theme_toggle"),
             ],
         ),
     }
@@ -2281,6 +2332,7 @@ class WindowManager:
         self.layout_mode = self.LAYOUT_COMBINED
         self.clock_seconds_enabled = False
         self.hide_info_panels = False
+        self.light_theme_enabled = False
 
     def add_window(self, window: Window) -> None:
         if window.title in self.windows:
@@ -2383,6 +2435,7 @@ class WindowManager:
         for name, window in self.windows.items():
             if not self.is_window_visible(name):
                 continue
+            window.light_theme = self.light_theme_enabled
             is_active = name == self.active_window_name
             if isinstance(window, DateTimeWindow):
                 window.render_time(is_active)
@@ -2409,6 +2462,8 @@ class WindowManager:
             return f"* {label}" if self.clock_seconds_enabled else label
         if action == "hide_info_panels_toggle":
             return f"* {label}" if self.hide_info_panels else label
+        if action == "light_theme_toggle":
+            return f"* {label}" if self.light_theme_enabled else label
         return label
 
     def open_context_menu(self, menu_number: int) -> None:
@@ -2523,9 +2578,10 @@ class WindowManager:
         for row in range(1, menu_window.getmaxyx()[0] - 1):
             menu_window.addstr(row, 1, " " * (menu_window.getmaxyx()[1] - 2))
         menu_window.attroff(curses.color_pair(3))
-        menu_window.attron(curses.color_pair(4))
-        menu_window.box()
-        menu_window.attroff(curses.color_pair(4))
+        menu_border_pair = LIGHT_THEME_ACTIVE_BORDER_PAIR if self.light_theme_enabled else 4
+        menu_window.attron(curses.color_pair(menu_border_pair))
+        draw_window_border(menu_window, self.light_theme_enabled)
+        menu_window.attroff(curses.color_pair(menu_border_pair))
 
         title = self.MENU_DEFINITIONS[self.context_menu_number][0]
         try:
@@ -2595,6 +2651,13 @@ class WindowManager:
         if action == "hide_info_panels_toggle":
             self.hide_info_panels = not self.hide_info_panels
             self.apply_layout()
+            return
+
+        if action == "light_theme_toggle":
+            self.light_theme_enabled = not self.light_theme_enabled
+            for window in self.windows.values():
+                window.light_theme = self.light_theme_enabled
+            self.redraw_screen()
             return
 
         file_manager = next(
