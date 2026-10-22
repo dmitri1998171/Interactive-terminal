@@ -138,8 +138,7 @@ def bottom_bar_labels(width: int) -> list[tuple[int, str, str]]:
         (58, "F6", "redo"),
         (70, "F7", "layout"),
         (84, "F8", "delete"),
-        (96, "F9", "next"),
-        (107, "F10", "quit"),
+        (96, "F10", "quit"),
     ]
 
     if width > 100:
@@ -152,8 +151,7 @@ def bottom_bar_labels(width: int) -> list[tuple[int, str, str]]:
             (65, "F6", "Redo"),
             (77, "F7", "Раскладка"),
             (93, "F8", "Удалить"),
-            (106, "F9", "След. окно"),
-            (122, "F10", "Выход"),
+            (106, "F10", "Выход"),
         ]
 
     return [label for label in labels if label[0] < width]
@@ -168,7 +166,6 @@ BOTTOM_BAR_KEY_CODES = {
     "F6": curses.KEY_F6,
     "F7": curses.KEY_F7,
     "F8": curses.KEY_F8,
-    "F9": curses.KEY_F9,
     "F10": curses.KEY_F10,
 }
 
@@ -1036,11 +1033,13 @@ class TerminalWindow(Window):
         self.file_operation_input_focused = False
         self.mode = "shell"
         self.previous_mode = "shell"
+        self.preview_mode = False
         self.shell = ShellSession(max(1, self.height - 2), max(1, self.width - 2))
         self.render()
 
-    def set_content(self, text: str, file_path: str | None = None) -> None:
+    def set_content(self, text: str, file_path: str | None = None, preview: bool = False) -> None:
         self.mode = "editor"
+        self.preview_mode = preview
         self.content_lines = text.split("\n") or [""]
         self.scroll_offset = 0
         self.cursor_row = 0
@@ -1054,6 +1053,12 @@ class TerminalWindow(Window):
         self.undo_history.clear()
         self.redo_history.clear()
         self.render()
+
+    def close_preview(self) -> None:
+        self.preview_mode = False
+        if self.mode == "editor":
+            self.mode = "shell"
+            self.render()
 
     def save_content(self) -> None:
         if self.file_path is None:
@@ -1683,8 +1688,7 @@ class TerminalWindow(Window):
 
     def handle_key(self, key: int | str) -> None:
         if key == 27:
-            self.mode = "shell"
-            self.render()
+            self.close_preview()
             return
         if isinstance(key, str):
             if key in ("\b", "\x7f"):
@@ -2221,7 +2225,7 @@ class FileManagerWindow(Window):
             loaded_file_path = file_path
         except OSError:
             text = f"Unable to read file: {file_path}"
-        self.terminal_window.set_content(text, loaded_file_path)
+        self.terminal_window.set_content(text, loaded_file_path, preview=True)
 
     def handle_key(self, key: int | str) -> None:
         if isinstance(key, str):
@@ -2452,6 +2456,18 @@ class WindowManager:
 
         if self.context_menu_panel is not None:
             self.render_context_menu()
+
+    def close_active_preview(self) -> bool:
+        file_manager = next(
+            (window for window in self.windows.values() if isinstance(window, FileManagerWindow)),
+            None,
+        )
+        if file_manager is None or file_manager.terminal_window is None:
+            return False
+        if not file_manager.terminal_window.preview_mode:
+            return False
+        file_manager.terminal_window.close_preview()
+        return True
 
     def resolve_menu_label(self, label: str, action: str) -> str:
         if action == "copy_move_mode_toggle":
@@ -2938,9 +2954,6 @@ class WindowManager:
         if isinstance(active_window, TerminalWindow) and not active_window.file_operation_active:
             if key == curses.KEY_F10:
                 return False
-            if key == curses.KEY_F9:
-                self.switch_active_window()
-                return True
             if shell_active and not key_from_mouse:
                 active_window.handle_shell_key(key)
                 self.render_windows()
@@ -2953,23 +2966,21 @@ class WindowManager:
         if key == curses.KEY_F10:
             return False
 
-        if key == curses.KEY_F9:
-            self.switch_active_window()
-            return True
-
         if key == 27:   # Escape key
             if isinstance(active_window, TerminalWindow) and active_window.file_operation_active:
                 active_window.handle_file_operation_key(key)
                 self.render_windows()
                 return True
-            return False
+            if self.close_active_preview():
+                self.render_windows()
+                return True
+            return True
 
         if key == 9:    # Tab key
             if isinstance(active_window, TerminalWindow) and active_window.file_operation_active:
                 active_window.handle_file_operation_key(key)
                 self.render_windows()
                 return True
-            self.switch_active_window()
             return True
 
         if key == curses.KEY_F2 and isinstance(active_window, FileManagerWindow):
