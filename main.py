@@ -45,6 +45,8 @@ SHIFT_ARROW_DOWN = -6
 SHIFT_ARROW_LEFT = -7
 SHIFT_ARROW_RIGHT = -8
 ALT_TAB_KEY = -12
+ALT_TAB_SEQUENCES = ("\t", "[9;3u", "[27;3;9~", "[1;3Z")
+ALT_TAB_BYTES = tuple(sequence.encode() for sequence in ALT_TAB_SEQUENCES)
 TOP_BAR_TEXT = "Files    Settings"
 
 SHELL_COLOR_MAP = {
@@ -130,34 +132,37 @@ def top_tab_menu_at(x: int, y: int) -> int | None:
 
 def bottom_bar_labels(width: int) -> list[tuple[int, str, str]]:
     labels = [
-        (1, "F1", "new"),
-        (10, "F2", "rename"),
-        (23, "F3", "copy"),
-        (34, "F4", "paste"),
-        (46, "F5", "undo"),
-        (58, "F6", "redo"),
-        (70, "F7", "layout"),
-        (84, "F8", "delete"),
-        (96, "F10", "quit"),
+        (1, "Alt+Tab", "next"),
+        (15, "F1", "new"),
+        (23, "F2", "rename"),
+        (34, "F3", "copy"),
+        (43, "F4", "paste"),
+        (53, "F5", "undo"),
+        (62, "F6", "redo"),
+        (71, "F7", "layout"),
+        (82, "F8", "delete"),
+        (93, "F10", "quit"),
     ]
 
     if width > 100:
         labels = [
-            (1, "F1", "Создать"),
-            (13, "F2", "Переим."),
-            (27, "F3", "Копия"),
-            (39, "F4", "Вставка"),
-            (53, "F5", "Undo"),
-            (65, "F6", "Redo"),
-            (77, "F7", "Раскладка"),
-            (93, "F8", "Удалить"),
-            (106, "F10", "Выход"),
+            (1, "Alt+Tab", "Переключ."),
+            (20, "F1", "Создать"),
+            (32, "F2", "Переим."),
+            (44, "F3", "Копия"),
+            (54, "F4", "Вставка"),
+            (66, "F5", "Undo"),
+            (75, "F6", "Redo"),
+            (84, "F7", "Раскладка"),
+            (98, "F8", "Удалить"),
+            (110, "F10", "Выход"),
         ]
 
     return [label for label in labels if label[0] < width]
 
 
 BOTTOM_BAR_KEY_CODES = {
+    "Alt+Tab": ALT_TAB_KEY,
     "F1": curses.KEY_F1,
     "F2": curses.KEY_F2,
     "F3": curses.KEY_F3,
@@ -965,6 +970,15 @@ class ShellSession:
                 except OSError:
                     pass
 
+    def is_at_prompt(self) -> bool:
+        """Return True when the shell itself, rather than a child process, owns the terminal."""
+        if self.master_fd < 0 or self.process is None:
+            return False
+        try:
+            return os.tcgetpgrp(self.master_fd) == self.process.pid
+        except OSError:
+            return False
+
     def close(self) -> None:
         self.alive = False
         if self.process is not None and self.process.poll() is None:
@@ -1034,6 +1048,7 @@ class TerminalWindow(Window):
         self.mode = "shell"
         self.previous_mode = "shell"
         self.preview_mode = False
+        self.shell_input_pending = False
         self.shell = ShellSession(max(1, self.height - 2), max(1, self.width - 2))
         self.render()
 
@@ -1659,8 +1674,10 @@ class TerminalWindow(Window):
                 self.shell.write(b"	")
             elif key in ("\n", "\r"):
                 self.shell.write(b"\r")
+                self.shell_input_pending = False
             elif key.isprintable():
                 self.shell.write(key.encode("utf-8"))
+                self.shell_input_pending = True
             return
 
         if key == curses.ERR:
@@ -1673,10 +1690,14 @@ class TerminalWindow(Window):
             return
         if key in (10, 13, curses.KEY_ENTER):
             self.shell.write(b"\r")
+            self.shell_input_pending = False
             return
         if key in (8, 127, curses.KEY_BACKSPACE):
             self.shell.write(b"\x7f")
             return
+
+        if key in (curses.KEY_UP, curses.KEY_DOWN):
+            self.shell_input_pending = True
 
         sequence = SHELL_KEY_SEQUENCES.get(key)
         if sequence is not None:
@@ -1685,6 +1706,8 @@ class TerminalWindow(Window):
 
         if 1 <= key <= 26:
             self.shell.write(bytes([key]))
+            if key in (3, 4, 21):
+                self.shell_input_pending = False
 
     def handle_key(self, key: int | str) -> None:
         if key == 27:
@@ -2337,6 +2360,8 @@ class WindowManager:
         self.clock_seconds_enabled = False
         self.hide_info_panels = False
         self.light_theme_enabled = False
+        # Some terminals cannot report Alt+Tab separately from Tab.
+        self.plain_tab_switches_windows = True
 
     def add_window(self, window: Window) -> None:
         if window.title in self.windows:
@@ -2464,9 +2489,10 @@ class WindowManager:
         )
         if file_manager is None or file_manager.terminal_window is None:
             return False
-        if not file_manager.terminal_window.preview_mode:
+        terminal_window = file_manager.terminal_window
+        if not terminal_window.preview_mode and terminal_window.mode != "editor":
             return False
-        file_manager.terminal_window.close_preview()
+        terminal_window.close_preview()
         return True
 
     def resolve_menu_label(self, label: str, action: str) -> str:
@@ -2749,6 +2775,12 @@ class WindowManager:
             key = window.getch()
         except curses.error:
             return curses.ERR
+
+        # Some terminals report Meta+Tab as a single control byte instead of
+        # the usual ESC/Tab (or CSI) sequence.
+        if key in (0x11, 0x89):
+            return ALT_TAB_KEY
+
         if key != 27:
             return key
 
@@ -2771,6 +2803,8 @@ class WindowManager:
         encoded = bytes(sequence) if all(0 <= value <= 0xFF for value in sequence) else b""
         if encoded in (b"[13;2u", b"[13;2~", b"[27;2;13~"):
             return SHIFT_ENTER_KEY
+        if encoded in ALT_TAB_BYTES:
+            return ALT_TAB_KEY
         return key
 
     @staticmethod
@@ -2779,6 +2813,12 @@ class WindowManager:
             key = window.get_wch()
         except curses.error:
             return curses.ERR
+
+        # Some terminals report Meta+Tab as a single control byte instead of
+        # the usual ESC/Tab (or CSI) sequence.
+        if key in (0x11, "\x11", 0x89, "\x89"):
+            return ALT_TAB_KEY
+
         if key != "\x1b":
             return key
 
@@ -2790,7 +2830,14 @@ class WindowManager:
                     next_key = window.get_wch()
                 except curses.error:
                     break
-                if next_key == curses.ERR or not isinstance(next_key, str):
+                if next_key == curses.ERR:
+                    break
+                # Control bytes (e.g. Tab = 0x09 in the "ESC + Tab" form of
+                # Alt+Tab) come back from get_wch as ints, not strings. They
+                # always terminate the escape sequence.
+                if isinstance(next_key, int):
+                    if 0 <= next_key <= 0xFF:
+                        sequence.append(chr(next_key))
                     break
                 sequence.append(next_key)
                 if len(sequence) > 1 and 0x40 <= ord(next_key) <= 0x7E:
@@ -2799,7 +2846,7 @@ class WindowManager:
             window.timeout(INPUT_POLL_INTERVAL_MS)
 
         encoded = "".join(sequence)
-        if encoded in ("	", "[9;3u", "[27;3;9~"):
+        if encoded in ALT_TAB_SEQUENCES:
             return ALT_TAB_KEY
         if encoded in ("[115;9u", "[83;10u"):
             return COMMAND_S_KEY
@@ -2948,6 +2995,9 @@ class WindowManager:
                     return True
 
         if key == ALT_TAB_KEY:
+            # The terminal reports Alt+Tab as a dedicated sequence, so plain
+            # Tab can stay available to the shell.
+            self.plain_tab_switches_windows = False
             self.switch_active_window()
             return True
 
@@ -2955,6 +3005,18 @@ class WindowManager:
             if key == curses.KEY_F10:
                 return False
             if shell_active and not key_from_mouse:
+                # Some terminals send Alt+Tab as a plain Tab. At an idle shell
+                # prompt use it to switch windows; while typing (or while a
+                # child process owns the terminal) keep Tab for the shell.
+                if (
+                    key == 9
+                    and self.plain_tab_switches_windows
+                    and not active_window.shell_input_pending
+                    and active_window.shell is not None
+                    and active_window.shell.is_at_prompt()
+                ):
+                    self.switch_active_window()
+                    return True
                 active_window.handle_shell_key(key)
                 self.render_windows()
                 return True
@@ -2981,6 +3043,9 @@ class WindowManager:
                 active_window.handle_file_operation_key(key)
                 self.render_windows()
                 return True
+            # Terminals without a Meta/Option mapping send Alt+Tab as a plain
+            # Tab. Treat it as the window-switching shortcut outside the shell.
+            self.switch_active_window()
             return True
 
         if key == curses.KEY_F2 and isinstance(active_window, FileManagerWindow):
