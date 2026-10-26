@@ -139,9 +139,8 @@ def bottom_bar_labels(width: int) -> list[tuple[int, str, str]]:
         (43, "F4", "paste"),
         (53, "F5", "undo"),
         (62, "F6", "redo"),
-        (71, "F7", "layout"),
-        (82, "F8", "delete"),
-        (93, "F10", "quit"),
+        (71, "F8", "delete"),
+        (82, "F10", "quit"),
     ]
 
     if width > 100:
@@ -153,9 +152,8 @@ def bottom_bar_labels(width: int) -> list[tuple[int, str, str]]:
             (54, "F4", "Вставка"),
             (66, "F5", "Undo"),
             (75, "F6", "Redo"),
-            (84, "F7", "Раскладка"),
-            (98, "F8", "Удалить"),
-            (110, "F10", "Выход"),
+            (84, "F8", "Удалить"),
+            (96, "F10", "Выход"),
         ]
 
     return [label for label in labels if label[0] < width]
@@ -169,7 +167,6 @@ BOTTOM_BAR_KEY_CODES = {
     "F4": curses.KEY_F4,
     "F5": curses.KEY_F5,
     "F6": curses.KEY_F6,
-    "F7": curses.KEY_F7,
     "F8": curses.KEY_F8,
     "F10": curses.KEY_F10,
 }
@@ -2325,6 +2322,11 @@ class WindowManager:
     LAYOUT_FILES_CENTER = "файловый менеджер по центру"
     LAYOUT_COMBINED = "комбинированный"
 
+    # Below these dimensions the info panels are hidden so that the Files and
+    # Terminal windows keep a usable size.
+    INFO_PANELS_MIN_LINES = 14
+    INFO_PANELS_MIN_COLUMNS = 50
+
     MENU_DEFINITIONS = {
         1: (
             "Files",
@@ -2359,6 +2361,7 @@ class WindowManager:
         self.layout_mode = self.LAYOUT_COMBINED
         self.clock_seconds_enabled = False
         self.hide_info_panels = False
+        self.auto_hide_info_panels = False
         self.light_theme_enabled = False
         # Some terminals cannot report Alt+Tab separately from Tab.
         self.plain_tab_switches_windows = True
@@ -2410,55 +2413,75 @@ class WindowManager:
         self.render_windows()
 
     def is_window_visible(self, name: str) -> bool:
-        if self.hide_info_panels and name in self.INFO_WINDOWS:
+        if name in self.INFO_WINDOWS and (self.hide_info_panels or self.auto_hide_info_panels):
             return False
         return True
 
+    def place_window(self, name: str, x1: int, y1: int, x2: int, y2: int) -> None:
+        window = self.windows.get(name)
+        if window is None:
+            return
+
+        columns = max(2, curses.COLS)
+        lines = max(2, curses.LINES)
+        x1 = max(0, min(int(x1), columns - 1))
+        y1 = max(0, min(int(y1), lines - 1))
+        x2 = max(x1 + 1, min(int(x2), columns))
+        y2 = max(y1 + 1, min(int(y2), lines))
+        window.set_geometry(x1, y1, x2, y2)
+
     def apply_layout(self) -> None:
-        columns, lines = curses.COLS, curses.LINES
-        bottom = lines - 3
-        files = self.windows.get("Files")
-        terminal = self.windows.get("Terminal")
+        columns = max(2, curses.COLS)
+        lines = max(2, curses.LINES)
+        top = min(2, lines - 1)
+        bottom = min(max(top + 1, lines - 3), lines)
 
-        if self.hide_info_panels:
-            half = columns // 2
-            if half < 1 or bottom < 3:
-                return
-            if files is not None:
-                files.set_geometry(0, 2, half, bottom)
-            if terminal is not None:
-                terminal.set_geometry(half, 2, columns, bottom)
+        self.auto_hide_info_panels = (
+            lines < self.INFO_PANELS_MIN_LINES
+            or columns < self.INFO_PANELS_MIN_COLUMNS
+        )
+
+        if self.hide_info_panels or self.auto_hide_info_panels:
+            half = max(1, min(columns // 2, columns - 1))
+            self.place_window("Files", 0, top, half, bottom)
+            self.place_window("Terminal", half, top, columns, bottom)
         else:
-            quarter = int(columns * 0.25)
-            three_quarters = int(columns * 0.75)
-            if quarter < 1 or three_quarters <= quarter or bottom < 3:
-                return
-            if files is not None:
-                files.set_geometry(0, 2, quarter, bottom)
-            if terminal is not None:
-                terminal.set_geometry(quarter, 2, three_quarters, bottom)
+            quarter = max(1, min(int(columns * 0.25), columns - 2))
+            three_quarters = max(quarter + 1, min(int(columns * 0.75), columns - 1))
 
-            clock = self.windows.get("Clock")
-            if clock is not None:
-                clock.set_geometry(three_quarters, 2, int(columns * 0.875), 7)
-            date = self.windows.get("Date")
-            if date is not None:
-                date.set_geometry(int(columns * 0.875), 2, columns, 7)
+            self.place_window("Files", 0, top, quarter, bottom)
+            self.place_window("Terminal", quarter, top, three_quarters, bottom)
 
-            system_info_geometry, hardware_info_geometry, network_info_geometry = right_panel_geometry(columns, lines)
-            for name, geometry in (
-                ("System info", system_info_geometry),
-                ("Hardware info", hardware_info_geometry),
-                ("Network info", network_info_geometry),
+            clock_split = max(three_quarters + 1, min(int(columns * 0.875), columns))
+            self.place_window("Clock", three_quarters, top, clock_split, 7)
+            self.place_window("Date", clock_split, top, columns, 7)
+
+            for name, geometry in zip(
+                ("System info", "Hardware info", "Network info"),
+                right_panel_geometry(columns, lines),
             ):
-                window = self.windows.get(name)
-                if window is not None:
-                    window.set_geometry(*geometry)
+                self.place_window(name, *geometry)
 
         if self.active_window_name is not None and not self.is_window_visible(self.active_window_name):
             self.active_window_name = "Files" if "Files" in self.windows else None
 
         self.redraw_screen()
+
+    def handle_resize(self) -> None:
+        try:
+            curses.update_lines_cols()
+        except AttributeError:
+            pass
+
+        menu_number = self.context_menu_number
+        if self.context_menu_window is not None:
+            self.close_context_menu()
+
+        self.apply_layout()
+
+        if menu_number is not None:
+            self.open_context_menu(menu_number)
+            self.render_windows()
 
     def render_windows(self) -> None:
         for name, window in self.windows.items():
@@ -2877,6 +2900,10 @@ class WindowManager:
             except curses.error:
                 key = curses.ERR
 
+            if key == curses.KEY_RESIZE:
+                self.handle_resize()
+                return True
+
             if key == 27:
                 self.close_context_menu()
             elif key == curses.KEY_MOUSE:
@@ -2927,6 +2954,9 @@ class WindowManager:
             input_window = modal_window.get_window()
             input_window.timeout(INPUT_POLL_INTERVAL_MS)
             key = self.read_modal_key(input_window)
+            if key == curses.KEY_RESIZE:
+                self.handle_resize()
+                return True
             if key == 27:
                 modal_window.close_create_file_modal()
                 self.modal_window_name = None
@@ -2957,6 +2987,9 @@ class WindowManager:
         )
         input_window.timeout(50 if shell_active else INPUT_POLL_INTERVAL_MS)
         key = self.read_terminal_key(input_window)
+        if key == curses.KEY_RESIZE:
+            self.handle_resize()
+            return True
         if key == "\x1b":
             key = 27
         elif key == "	":
@@ -3190,7 +3223,7 @@ def run(stdscr: curses.window) -> None:
     window_manager.add_window(NetworkInfoWindow(*network_info_geometry, "Network info"))
 
     window_manager.active_window_name = "Files"
-    window_manager.render_windows()
+    window_manager.apply_layout()
 
     try:
         while window_manager.handle_input():
